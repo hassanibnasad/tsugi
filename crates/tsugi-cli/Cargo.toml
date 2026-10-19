@@ -1,0 +1,26 @@
+[package]
+name = "tsugi-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "tsugi CLI binary — enterprise-grade terminal Git assistant"
+
+[[bin]]
+name = "tsugi"
+path = "src/bin/tsugi.rs"
+
+[[bin]]
+name = "git-tsugi"
+path = "src/bin/git-tsugi.rs"
+
+[dependencies]
+tsugi-core = { path = "../tsugi-core" }
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+colored.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+chrono.workspace = true
