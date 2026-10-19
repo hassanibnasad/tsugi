@@ -1,0 +1,60 @@
+[workspace]
+members = ["crates/tsugi-core", "crates/tsugi-cli"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["Tsugi Contributors"]
+license = "Apache-2.0"
+description = "Enterprise-grade, terminal-native Git assistant powered by a local SLM"
+repository = "https://github.com/tsugi-ai/tsugi"
+keywords = ["git", "ai", "cli", "llm", "terminal"]
+categories = ["command-line-utilities", "development-tools"]
+
+[workspace.dependencies]
+# Git state inspection (libgit2 bindings)
+git2 = { version = "0.21", default-features = false, features = ["vendored-libgit2"] }
+
+# LLM inference (llama.cpp bindings with GBNF grammar support)
+llama-cpp-2 = "0.1"
+
+# System introspection (available RAM check for model tier selection)
+sysinfo = "0.33"
+
+# Local audit ledger
+rusqlite = { version = "0.40", features = ["bundled"] }
+
+# CLI framework
+clap = { version = "4", features = ["derive", "env", "color"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Colored terminal output
+colored = "3"
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Directory paths
+dirs = "6"
+
+# UUID generation for snapshot IDs
+uuid = { version = "1", features = ["v4"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+panic = "abort"

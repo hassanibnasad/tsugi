@@ -1,0 +1,19 @@
+# Build artifacts
+/target/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Model files (large binaries — download separately)
+*.gguf
+
+# Local config
+.tsugi/
