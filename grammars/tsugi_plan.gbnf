@@ -1,0 +1,22 @@
+# Root rules
+root ::= "{" ws
+    "\"root_cause\"" ws ":" ws string "," ws
+    "\"risk_tier\"" ws ":" ws risk-tier "," ws
+    "\"execution_steps\"" ws ":" ws "[" ws step ("," ws step)* ws "]" "," ws
+    "\"rollback_cmd\"" ws ":" ws string ws
+    "}"
+
+# A single execution step
+step ::= "{" ws
+    "\"cmd\"" ws ":" ws string "," ws
+    "\"explanation\"" ws ":" ws string ws
+    "}"
+
+# Risk tier enum — exactly one of these four values
+risk-tier ::= "\"READ_ONLY\"" | "\"MUTATING_SAFE\"" | "\"MUTATING_DANGEROUS\"" | "\"HISTORY_REWRITE\""
+
+# JSON string (double-quoted, with escape support)
+string ::= "\"" ([^"\\] | "\\" .)* "\""
+
+# Optional whitespace
+ws ::= [ \t\n]*
