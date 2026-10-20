@@ -36,17 +36,6 @@ enum PolicyAction {
 
 /// The complete set of safety policies.
 static POLICIES: &[PolicyRule] = &[
-    // ── Force Push ────────────────────────────────────────────────────
-    PolicyRule {
-        pattern: "git push --force ",
-        action: PolicyAction::Rewrite("git push --force ", "git push --force-with-lease "),
-        reason: "Replaced --force with --force-with-lease to prevent overwriting collaborators' work",
-    },
-    PolicyRule {
-        pattern: "git push -f ",
-        action: PolicyAction::Rewrite("git push -f ", "git push --force-with-lease "),
-        reason: "Replaced -f with --force-with-lease to prevent overwriting collaborators' work",
-    },
     // ── Hard Reset ────────────────────────────────────────────────────
     PolicyRule {
         pattern: "git reset --hard",
@@ -113,6 +102,18 @@ static POLICIES: &[PolicyRule] = &[
     },
 ];
 
+/// Check if a space-separated pattern appears as a contiguous token sequence in the command.
+fn matches_command_pattern(cmd: &str, pattern: &str) -> bool {
+    let cmd_tokens: Vec<&str> = cmd.split_whitespace().collect();
+    let pat_tokens: Vec<&str> = pattern.split_whitespace().collect();
+    if pat_tokens.is_empty() || cmd_tokens.is_empty() || pat_tokens.len() > cmd_tokens.len() {
+        return false;
+    }
+    cmd_tokens
+        .windows(pat_tokens.len())
+        .any(|window| window == pat_tokens.as_slice())
+}
+
 /// Apply all safety policies to a resolution plan.
 ///
 /// This function:
@@ -131,8 +132,39 @@ pub fn apply_guardrails(
     let mut modified_steps = Vec::with_capacity(plan.execution_steps.len());
 
     for mut step in plan.execution_steps {
+        // First handle force-push flag rewriting on token level
+        let cmd_tokens: Vec<&str> = step.cmd.split_whitespace().collect();
+        if cmd_tokens.starts_with(&["git", "push"]) {
+            let mut rewritten = false;
+            let new_tokens: Vec<String> = cmd_tokens
+                .iter()
+                .map(|tok| {
+                    if *tok == "--force" || *tok == "-f" {
+                        rewritten = true;
+                        "--force-with-lease".to_string()
+                    } else {
+                        tok.to_string()
+                    }
+                })
+                .collect();
+
+            if rewritten {
+                let original = step.cmd.clone();
+                step.cmd = new_tokens.join(" ");
+                info!(
+                    "Guardrail: rewrote '{}' → '{}'. Reason: Replaced force push with --force-with-lease to protect shared history",
+                    original, step.cmd
+                );
+                step.explanation = format!(
+                    "{} [GUARDRAIL: Replaced --force/-f with --force-with-lease to prevent overwriting collaborators' work]",
+                    step.explanation
+                );
+            }
+        }
+
+        // Check against static policies
         for rule in POLICIES {
-            if step.cmd.contains(rule.pattern) {
+            if matches_command_pattern(&step.cmd, rule.pattern) {
                 match &rule.action {
                     PolicyAction::Rewrite(from, to) => {
                         let original = step.cmd.clone();
