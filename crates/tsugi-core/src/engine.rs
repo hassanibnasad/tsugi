@@ -37,8 +37,88 @@ use crate::types::{
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Public API
+// Public API & InferenceBackend Seam
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Seam defining model inference for resolution planning.
+///
+/// Implementations adapt physical inference vehicles (local llama-cli subprocess,
+/// local HTTP llama-server, in-process FFI, or in-memory fakes) behind a common interface.
+pub trait InferenceBackend: Send + Sync {
+    /// Generate a resolution plan given the fact sheet and user intent.
+    fn generate_plan(
+        &self,
+        state: &RepoState,
+        user_intent: &str,
+        config: &TsugiConfig,
+    ) -> Result<ResolutionPlan, TsugiError>;
+}
+
+/// Production inference adapter wrapping local `llama-cli` and `llama-server`.
+#[derive(Debug, Default, Clone)]
+pub struct LlamaCliBackend;
+
+impl InferenceBackend for LlamaCliBackend {
+    fn generate_plan(
+        &self,
+        state: &RepoState,
+        user_intent: &str,
+        config: &TsugiConfig,
+    ) -> Result<ResolutionPlan, TsugiError> {
+        resolve_with_llm(state, user_intent, config)
+    }
+}
+
+/// Create a boxed default inference backend.
+pub fn default_backend() -> Box<dyn InferenceBackend> {
+    Box::new(LlamaCliBackend)
+}
+
+/// In-memory fake inference adapter for hermetic unit/integration tests and offline environments.
+#[derive(Debug, Clone)]
+pub struct MockInferenceBackend {
+    canned_plan: Option<ResolutionPlan>,
+}
+
+impl MockInferenceBackend {
+    /// Create a mock backend that always returns the specified canned plan.
+    pub fn new(canned_plan: ResolutionPlan) -> Self {
+        Self {
+            canned_plan: Some(canned_plan),
+        }
+    }
+
+    /// Create a mock backend with a default safe testing plan.
+    pub fn with_default_test_plan() -> Self {
+        Self {
+            canned_plan: Some(ResolutionPlan {
+                root_cause: "Mock resolution".to_string(),
+                risk_tier: RiskTier::MutatingSafe,
+                execution_steps: vec![ExecutionStep {
+                    cmd: "git status".to_string(),
+                    explanation: "Check status".to_string(),
+                    requires_confirmation: false,
+                }],
+                rollback_cmd: "git status".to_string(),
+                source: PlanSource::LlmPrimary,
+                confidence: 1.0,
+            }),
+        }
+    }
+}
+
+impl InferenceBackend for MockInferenceBackend {
+    fn generate_plan(
+        &self,
+        _state: &RepoState,
+        _user_intent: &str,
+        _config: &TsugiConfig,
+    ) -> Result<ResolutionPlan, TsugiError> {
+        self.canned_plan
+            .clone()
+            .ok_or_else(|| TsugiError::InferenceError("No mock plan configured".to_string()))
+    }
+}
 
 /// Resolve a Git issue by invoking the local LLM with grammar-constrained generation.
 ///
@@ -511,5 +591,39 @@ Done!"#;
         // On any machine with > 1.2 GB free, this should be Primary.
         // We don't assert a specific value since it depends on the test machine.
         assert!(matches!(tier, ModelTier::Primary | ModelTier::Fallback));
+    }
+
+    #[test]
+    fn test_mock_inference_backend() {
+        let backend = MockInferenceBackend::with_default_test_plan();
+        let config = TsugiConfig::default();
+        let state = RepoState {
+            repo_root: std::path::PathBuf::from("/tmp"),
+            head: crate::types::HeadState::Unborn {
+                branch: "main".to_string(),
+            },
+            ongoing_operation: None,
+            conflicts: vec![],
+            working_tree: crate::types::WorkingTreeSummary {
+                staged_new: 0,
+                staged_modified: 0,
+                staged_deleted: 0,
+                staged_renamed: 0,
+                unstaged_modified: 0,
+                unstaged_deleted: 0,
+                untracked: 0,
+                ignored_but_tracked: 0,
+            },
+            recent_commits: vec![],
+            recent_reflog: vec![],
+            tracking: None,
+            stash_count: 0,
+            has_submodules: false,
+            safe_rollback_ref: None,
+        };
+
+        let plan = backend.generate_plan(&state, "test", &config).unwrap();
+        assert_eq!(plan.root_cause, "Mock resolution");
+        assert_eq!(plan.risk_tier, RiskTier::MutatingSafe);
     }
 }
