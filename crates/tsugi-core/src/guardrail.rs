@@ -24,8 +24,6 @@ struct PolicyRule {
 }
 
 enum PolicyAction {
-    /// Rewrite the command to a safer equivalent.
-    Rewrite(&'static str, &'static str),
     /// Block the command entirely.
     Block,
     /// Force user confirmation before execution.
@@ -166,19 +164,6 @@ pub fn apply_guardrails(
         for rule in POLICIES {
             if matches_command_pattern(&step.cmd, rule.pattern) {
                 match &rule.action {
-                    PolicyAction::Rewrite(from, to) => {
-                        let original = step.cmd.clone();
-                        step.cmd = step.cmd.replace(from, to);
-                        info!(
-                            "Guardrail: rewrote '{}' → '{}'. Reason: {}",
-                            original, step.cmd, rule.reason
-                        );
-                        step.explanation = format!(
-                            "{} [GUARDRAIL: {}]",
-                            step.explanation, rule.reason
-                        );
-                    }
-
                     PolicyAction::Block => {
                         return Err(TsugiError::PolicyViolation(format!(
                             "Command '{}' was blocked by safety policy: {}",

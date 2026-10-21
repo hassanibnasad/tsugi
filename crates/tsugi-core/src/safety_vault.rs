@@ -330,7 +330,8 @@ mod tests {
         index.write().unwrap();
         let tree_id = index.write_tree().unwrap();
         let tree = repo.find_tree(tree_id).unwrap();
-        repo.commit(Some("HEAD"), &sig, &sig, "Second commit", &tree, &[])
+        let parent = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "Second commit", &tree, &[&parent])
             .unwrap();
 
         // Verify latest snapshot is found
