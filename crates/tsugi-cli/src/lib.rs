@@ -27,20 +27,16 @@ use std::process;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use colored::Colorize;
-use tracing::info;
 use tracing_subscriber::{fmt, EnvFilter};
 
 use tsugi_core::{
     config::{self, check_setup, load_config, SetupStatus},
     engine,
-    executor,
     formatter,
-    guardrail,
-    ledger::Ledger,
     probe,
-    snapshot,
     tier0,
     types::RiskTier,
+    PlanOutcome, TerminalObserver, TsugiEngine,
 };
 
 #[derive(Parser)]
@@ -163,51 +159,36 @@ fn cmd_fix(repo_path: &PathBuf, user_intent: &str, auto_confirm: bool, json_outp
         formatter::print_banner();
     }
 
+    let config = load_config().context("Failed to load configuration")?;
+    let engine = TsugiEngine::new(config)?;
+
     // Layer 1: Probe repository state
-    let state = probe::probe_repo_state(repo_path)
+    let state = engine.probe(repo_path)
         .context("Failed to probe repository state")?;
 
     if !json_output {
         formatter::print_diagnosis(&state);
     }
 
-    // Layer 2: Try Tier-0 deterministic resolution first
-    let mut plan = if let Some(t0_plan) = tier0::try_resolve(&state, user_intent) {
-        info!("Tier-0 fast-path matched — no LLM needed");
-        t0_plan
-    } else {
-        // Layer 3: Fall back to LLM inference
-        let config = load_config().context("Failed to load configuration")?;
-
-        // Check if LLM is available
-        match check_setup() {
-            SetupStatus::Ready { .. } => {
-                info!("Invoking LLM inference engine");
-                engine::resolve_with_llm(&state, user_intent, &config)
-                    .context("LLM inference failed")?
+    // Layer 2 & 3: Produce a guardrail-checked plan
+    let plan = match engine.plan(&state, user_intent)? {
+        PlanOutcome::Ready(p) => p,
+        PlanOutcome::SetupNeeded => {
+            if !json_output {
+                formatter::print_setup_needed();
+                println!(
+                    "\n  {} {}",
+                    "Hint:".cyan().bold(),
+                    "Tier-0 fast-path couldn't match this issue. A local AI model is needed."
+                );
+                println!(
+                    "  Run {} to set up the AI engine.",
+                    "tsugi setup".white().bold()
+                );
             }
-            _ => {
-                if !json_output {
-                    formatter::print_setup_needed();
-                    println!(
-                        "\n  {} {}",
-                        "Hint:".cyan().bold(),
-                        "Tier-0 fast-path couldn't match this issue. A local AI model is needed."
-                    );
-                    println!(
-                        "  Run {} to set up the AI engine.",
-                        "tsugi setup".white().bold()
-                    );
-                }
-                return Ok(());
-            }
+            return Ok(());
         }
     };
-
-    // Layer 4a: Apply guardrails
-    let config = load_config().unwrap_or_default();
-    plan = guardrail::apply_guardrails(plan, &config)
-        .context("Guardrail policy check failed")?;
 
     if json_output {
         println!("{}", serde_json::to_string_pretty(&plan)?);
@@ -238,47 +219,11 @@ fn cmd_fix(repo_path: &PathBuf, user_intent: &str, auto_confirm: bool, json_outp
         }
     }
 
-    // Layer 4b: Create shadow snapshot before executing
-    let ledger = Ledger::open_default().context("Failed to open audit ledger")?;
-
-    if config.auto_snapshot && plan.risk_tier != RiskTier::ReadOnly {
-        match snapshot::create_snapshot(repo_path, &plan, &ledger) {
-            Ok(snap) => {
-                info!("Shadow snapshot created: {}", snap.id);
-                if !json_output {
-                    println!(
-                        "\n  {} Snapshot saved (run {} to restore)",
-                        "📸".to_string(),
-                        "tsugi undo".white().bold()
-                    );
-                }
-            }
-            Err(e) => {
-                eprintln!(
-                    "  {} Failed to create snapshot: {}",
-                    "⚠".yellow(),
-                    e
-                );
-                // Continue anyway — snapshot failure shouldn't block resolution
-            }
-        }
-    }
-
-    // Execute the plan
+    // Execute the plan through the observer seam
     println!("\n{}", "─── Executing ─────────────────────────────".dimmed());
 
-    let executed = executor::execute_plan(&plan, repo_path, auto_confirm)?;
-
-    // Record the operation in the ledger
-    ledger.record_operation(
-        &repo_path.to_string_lossy(),
-        user_intent,
-        &plan.source.to_string(),
-        &plan.risk_tier.to_string(),
-        &executed,
-        true,
-        None,
-    )?;
+    let observer = TerminalObserver::new(auto_confirm);
+    let _executed = engine.execute(repo_path, &plan, user_intent, &observer)?;
 
     println!("\n  {} {}", "✔".green().bold(), "Resolution complete!".green().bold());
 
@@ -332,10 +277,10 @@ fn cmd_diagnose(repo_path: &PathBuf, json_output: bool) -> Result<()> {
 fn cmd_undo(repo_path: &PathBuf) -> Result<()> {
     formatter::print_banner();
 
-    let ledger = Ledger::open_default().context("Failed to open audit ledger")?;
+    let config = load_config().unwrap_or_default();
+    let engine = TsugiEngine::new(config)?;
 
-    let snapshot = ledger
-        .get_latest_snapshot()
+    let snapshot = engine.vault().get_latest_snapshot()
         .context("Failed to query snapshots")?;
 
     match snapshot {
@@ -360,7 +305,7 @@ fn cmd_undo(repo_path: &PathBuf) -> Result<()> {
                 return Ok(());
             }
 
-            snapshot::restore_snapshot(repo_path, &snap, &ledger)
+            engine.undo(repo_path)
                 .context("Snapshot restore failed")?;
 
             formatter::print_undo_result(true, &snap.plan_summary);
@@ -380,10 +325,11 @@ fn cmd_undo(repo_path: &PathBuf) -> Result<()> {
 fn cmd_history(repo_path: &PathBuf, limit: usize) -> Result<()> {
     formatter::print_banner();
 
-    let ledger = Ledger::open_default().context("Failed to open audit ledger")?;
+    let config = load_config().unwrap_or_default();
+    let engine = TsugiEngine::new(config)?;
 
-    let operations = ledger
-        .recent_operations(Some(&repo_path.to_string_lossy()), limit)
+    let operations = engine
+        .history(Some(&repo_path.to_string_lossy()), limit)
         .context("Failed to query operation history")?;
 
     formatter::print_history(&operations);
@@ -490,9 +436,10 @@ fn cmd_setup() -> Result<()> {
 fn cmd_cleanup(repo_path: &PathBuf, days: u32) -> Result<()> {
     formatter::print_banner();
 
-    let ledger = Ledger::open_default().context("Failed to open audit ledger")?;
+    let config = load_config().unwrap_or_default();
+    let engine = TsugiEngine::new(config)?;
 
-    let cleaned = snapshot::cleanup_old_snapshots(repo_path, days, &ledger)
+    let cleaned = engine.cleanup(repo_path, days)
         .context("Cleanup failed")?;
 
     println!(
