@@ -493,10 +493,7 @@ fn extract_json(raw: &str) -> Result<String, TsugiError> {
 
 /// Returns the default path for the GBNF grammar file.
 fn default_grammar_path() -> PathBuf {
-    let config_dir = dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("tsugi");
-    config_dir.join("tsugi_plan.gbnf")
+    crate::config::config_dir().join("tsugi_plan.gbnf")
 }
 
 /// Generate and write the default GBNF grammar file if it doesn't exist.

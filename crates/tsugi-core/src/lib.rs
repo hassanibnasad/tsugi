@@ -24,7 +24,6 @@ pub mod probe;
 pub mod tier0;
 pub mod engine;
 pub mod guardrail;
-pub mod snapshot;
 pub mod ledger;
 pub mod safety_vault;
 pub mod config;
