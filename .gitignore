@@ -17,3 +17,9 @@ desktop.ini
 
 # Local config
 .tsugi/
+
+# Python & training artifacts
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+training/dataset/*.jsonl

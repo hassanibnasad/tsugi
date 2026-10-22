@@ -5,625 +5,979 @@ tsugi (次) Synthetic Dataset Generator for SLM Fine-Tuning.
 Generates ground-truth pairs of:
   (RepoState fact sheet + User Intent) -> Strict JSON ResolutionPlan
 
-Covers high-frequency, complex, and catastrophic Git incidents:
-1. Merge Conflicts (content, deleted-by-them, binary)
-2. In-Progress Rebases (paused, aborted, merge conflicts mid-rebase)
-3. Detached HEAD states (accidental checkout of commit, remote branch, tag)
-4. Uncommitted dirty tree preventing checkout/pull/rebase
-5. Accidental commits to protected branches (main/production)
-6. Diverged tracking branches with local unpushed commits
-7. Stash pop collisions and orphaned stashes
-8. Submodule pointer desync and detached submodules
-9. Stale lockfiles (.git/index.lock, rebase-merge/.lock)
-10. Accidental hard resets / lost commits needing reflog recovery
-11. Untracked file collisions during branch switch
-12. Cherry-pick failures with partial commit state
+Guaranteed 100% schema alignment with Rust runtime (types.rs, engine.rs, tsugi_plan.gbnf):
+1. Fact Sheet Header: [REPO_STATE] ...
+2. User Intent Prefix: USER_INTENT: <intent>
+3. Risk Tier Enum: "READ_ONLY", "MUTATING_SAFE", "MUTATING_DANGEROUS", "HISTORY_REWRITE"
+4. Step Object Keys: {"cmd": "...", "explanation": "..."}
+5. Rollback Field: "rollback_cmd": "<single git command>"
+6. System Prompt: Exactly mirrors engine.rs system prompt.
 
+Parametric generation prevents memorization/overfitting across 5,000+ diverse training examples.
 Outputs in standard ChatML format ready for Unsloth / HuggingFace fine-tuning.
 """
 
 import json
 import random
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
 
-SYSTEM_PROMPT = """You are Tsugi's core Git resolution engine. Your role is to analyze a broken Git repository state and generate an enterprise-grade ResolutionPlan in strict JSON conforming to the tsugi schema. Every plan must include:
-1. root_cause: Clear, precise diagnosis.
-2. risk_tier: One of "Safe", "Caution", "Dangerous", "Destructive".
-3. execution_steps: Ordered array of atomic commands with rationale and confirmation requirements.
-4. rollback_plan: Inverse commands to restore state if execution fails or user requests undo.
-5. explanation: Human-friendly explanation under 3 sentences.
-Do not output markdown code blocks or commentary outside the JSON."""
+SYSTEM_PROMPT = """You are tsugi, an expert Git diagnostic and resolution engine. You receive a structured Git repository state and a user's description of their issue. You must output a JSON resolution plan.
 
-def format_repo_state(state: Dict[str, Any]) -> str:
-    lines = [
-        "Repository State Fact Sheet:",
-        f"- Current Branch: {state.get('branch', 'main')} (detached: {str(state.get('is_detached', False)).lower()})",
-        f"- HEAD Commit: {state.get('head_oid', 'a1b2c3d')} \"{state.get('head_summary', 'Update files')}\"",
-        f"- Upstream: {state.get('upstream', 'origin/main')} (ahead: {state.get('ahead', 0)}, behind: {state.get('behind', 0)})",
-        f"- In-progress Operation: {state.get('operation', 'None')}",
-        f"- Unmerged Paths (conflicts): {json.dumps(state.get('conflicts', []))}",
-        f"- Working Tree: {state.get('modified_count', 0)} modified, {state.get('staged_count', 0)} staged, {state.get('untracked_count', 0)} untracked",
-        f"- Stash Count: {state.get('stash_count', 0)}",
-    ]
-    if state.get("extra_details"):
-        lines.append(f"- Additional Diagnostic Facts: {state['extra_details']}")
+Rules:
+1. Diagnose the root cause from the repository state.
+2. Classify the risk tier: READ_ONLY, MUTATING_SAFE, MUTATING_DANGEROUS, or HISTORY_REWRITE.
+3. Output the minimum sequence of Git commands to resolve the issue.
+4. Include a rollback command that fully reverses the operation.
+5. Never use `git push --force` — always use `git push --force-with-lease`.
+6. Never use `git reset --hard` without a prior backup step.
+7. Prefer `git switch` over `git checkout` for branch operations.
+8. Always preserve uncommitted work — stash before destructive operations."""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Randomization Pools for Generalization
+# ─────────────────────────────────────────────────────────────────────────────
+
+BRANCH_PREFIXES = ["feature", "feat", "fix", "bugfix", "refactor", "chore", "hotfix", "perf", "test"]
+
+BRANCH_TOPICS = [
+    "payments", "auth-pkce", "user-profiles", "login-race", "checkout-crash",
+    "database-pool", "upgrade-deps", "dark-mode", "search-indexer", "cors-headers",
+    "file-upload", "token-refresh", "analytics-pipeline", "router-migration",
+    "multi-tenancy", "deadlock-worker", "notifications-ws", "api-client-v2",
+    "billing-webhook", "memory-leak-fix", "session-store", "sso-saml",
+    "rate-limiter", "graphql-schema", "audit-logs", "redis-cluster",
+    "image-resizer", "metrics-collector", "tenant-isolation", "email-templates",
+    "export-csv", "import-job", "websocket-heartbeat", "grpc-service"
+]
+
+FILES = [
+    "src/auth.ts", "src/api/handler.rs", "package.json", "Cargo.toml", "src/models/user.py",
+    "config/database.yml", "go.mod", "src/components/Header.tsx", "README.md", "Dockerfile",
+    "src/lib.rs", "server/index.js", "src/services/payment.ts", "src/routes/api.ts",
+    "config/settings.json", "src/middleware/auth.go", "tests/integration_test.rs",
+    "src/views/Dashboard.vue", "crates/core/src/state.rs", "app/controllers/users_controller.rb",
+    "lib/cache.ex", "src/styles/theme.css", "scripts/deploy.sh", "docker-compose.yml",
+    "migrations/0002_add_index.sql", "src/client/http.go", "internal/server/server.go",
+    "frontend/src/App.tsx", "backend/main.py", "pkg/storage/s3.go"
+]
+
+SECRET_FILES = [
+    ".env", ".env.local", ".env.production", "client_secrets.json", "id_rsa",
+    "credentials.json", "certs/server.key", "secrets.toml", "aws_credentials",
+    "config/master.key", "service-account.json"
+]
+
+COMMIT_SUMMARIES = [
+    "Integrate payment gateway", "Fix race condition in worker pool", "Add OAuth2 validation",
+    "Bump dependencies to latest", "Initial skeleton layout", "Refactor elasticsearch client",
+    "Add error handling middleware", "Update documentation and readme", "Fix null pointer dereference",
+    "Optimize database queries", "Add integration test suite", "Implement password reset flow",
+    "Clean up legacy configuration", "Add Prometheus metrics endpoint", "Fix memory leak in buffer pool",
+    "Support dark mode theme", "Migrate authentication to JWT", "Add rate limiting on public routes",
+    "Improve test coverage in billing module", "Validate webhook signature correctly"
+]
+
+CONFLICT_TYPES = [
+    "both_modified", "deleted_by_us", "deleted_by_them", "both_added", "renamed_modified"
+]
+
+
+def random_sha(rng: random.Random) -> str:
+    return f"{rng.randint(0x1000000, 0xfffffff):07x}"
+
+
+def random_branch(rng: random.Random) -> str:
+    prefix = rng.choice(BRANCH_PREFIXES)
+    topic = rng.choice(BRANCH_TOPICS)
+    if rng.random() < 0.2:
+        return f"{prefix}/PROJ-{rng.randint(100, 999)}-{topic}"
+    return f"{prefix}/{topic}"
+
+
+def format_repo_state(
+    head: str,
+    ongoing_op: str = "NONE",
+    conflicts: Optional[List[str]] = None,
+    staged: str = "+0 ~0 -0 R0",
+    unstaged: str = "~0 -0",
+    untracked: int = 0,
+    tracking: Optional[str] = None,
+    stashes: int = 0,
+    safe_rollback_target: Optional[str] = None,
+    recent_commits: Optional[List[str]] = None,
+    reflog: Optional[List[str]] = None,
+) -> str:
+    """Formats Symbolic State Fact Sheet in exact format expected by Rust runtime."""
+    lines = ["[REPO_STATE]"]
+    lines.append(f"HEAD: {head}")
+    lines.append(f"ONGOING_OP: {ongoing_op}")
+
+    if not conflicts:
+        lines.append("CONFLICTS: NONE")
+    else:
+        conflict_strs = []
+        for c in conflicts:
+            if "(" in c:
+                conflict_strs.append(c)
+            else:
+                conflict_strs.append(f'"{c}" (both_modified)')
+        lines.append(f"CONFLICTS: [{', '.join(conflict_strs)}]")
+
+    lines.append(f"STAGED: {staged} | UNSTAGED: {unstaged} | UNTRACKED: {untracked}")
+
+    if tracking:
+        lines.append(f"TRACKING: {tracking}")
+
+    if stashes > 0:
+        lines.append(f"STASHES: {stashes}")
+
+    if safe_rollback_target:
+        lines.append(f"SAFE_ROLLBACK_TARGET: {safe_rollback_target}")
+
+    if recent_commits:
+        lines.append("RECENT_COMMITS:")
+        for c in recent_commits[:5]:
+            lines.append(f"  {c}")
+
+    if reflog and ongoing_op != "NONE":
+        lines.append("REFLOG:")
+        for r in reflog[:5]:
+            lines.append(f"  {r}")
+
     return "\n".join(lines)
 
 
-def generate_scenarios() -> List[Dict[str, Any]]:
-    scenarios = []
+# ─────────────────────────────────────────────────────────────────────────────
+# Incident Generators (Combinatorial & Procedural)
+# ─────────────────────────────────────────────────────────────────────────────
 
-    # 1. Merge Conflict in Progress
-    scenarios.append({
-        "state": {
-            "branch": "feature/payments",
-            "is_detached": False,
-            "head_oid": "4f9a1b2",
-            "head_summary": "Integrate Stripe webhooks",
-            "upstream": "origin/feature/payments",
-            "ahead": 2,
-            "behind": 5,
-            "operation": "Merge",
-            "conflicts": ["src/api/webhook.ts", "package.json"],
-            "modified_count": 0,
-            "staged_count": 1,
-            "untracked_count": 0,
-            "stash_count": 0,
-            "extra_details": "MERGE_HEAD points to 88d3e1c (origin/main)"
-        },
-        "intents": [
-            "I have merge conflicts while merging main into my branch and don't know what to do",
-            "Git says automatic merge failed, fix conflicts and commit result",
-            "Merge conflict in webhook.ts and package.json",
+def incident_merge_conflict(rng: random.Random) -> Tuple[str, str, Dict[str, Any]]:
+    branch = random_branch(rng)
+    sha = random_sha(rng)
+    other_sha = random_sha(rng)
+    num_conf = rng.randint(1, 3)
+    files = rng.sample(FILES, num_conf)
+    conf_list = [f'"{f}" ({rng.choice(CONFLICT_TYPES)})' for f in files]
+
+    fact_sheet = format_repo_state(
+        head=f"ATTACHED to {branch} ({sha})",
+        ongoing_op=f"MERGE in progress (merging {other_sha})",
+        conflicts=conf_list,
+        staged=f"+{rng.randint(0, 2)} ~0 -0 R0",
+        unstaged=f"~{num_conf} -0",
+        untracked=0,
+        tracking=f"origin/{branch} (ahead 1, behind 2)",
+        recent_commits=[
+            f"{sha} {rng.choice(COMMIT_SUMMARIES)}",
+            f"{random_sha(rng)} {rng.choice(COMMIT_SUMMARIES)}"
         ],
-        "plan": {
-            "root_cause": "Active merge conflict between feature/payments and origin/main in 2 files.",
-            "risk_tier": "Caution",
-            "execution_steps": [
-                {
-                    "step_number": 1,
-                    "command": "git status --short",
-                    "rationale": "List conflicted files clearly to inspect resolution status.",
-                    "requires_confirmation": False
-                },
-                {
-                    "step_number": 2,
-                    "command": "git diff --name-only --diff-filter=U",
-                    "rationale": "Isolate all paths currently containing unresolved conflict markers.",
-                    "requires_confirmation": False
-                }
-            ],
-            "rollback_plan": {
-                "steps": [
-                    {
-                        "step_number": 1,
-                        "command": "git merge --abort",
-                        "rationale": "Abort in-progress merge and return branch exactly to pre-merge HEAD.",
-                        "requires_confirmation": False
-                    }
-                ],
-                "explanation": "Aborting the merge reverts working tree and index to the commit prior to merge start."
-            },
-            "explanation": "You have an active merge with conflict markers in src/api/webhook.ts and package.json. Resolve markers or run 'git merge --abort' to cancel."
-        }
-    })
+        reflog=[
+            f"0: {sha} merge origin/main: Fast-forward",
+            f"1: {other_sha} commit: {rng.choice(COMMIT_SUMMARIES)}"
+        ]
+    )
 
-    # 2. Detached HEAD after checking out commit
-    scenarios.append({
-        "state": {
-            "branch": "HEAD",
-            "is_detached": True,
-            "head_oid": "d2e3f4a",
-            "head_summary": "Fix race condition in worker pool",
-            "upstream": None,
-            "ahead": 0,
-            "behind": 0,
-            "operation": "None",
-            "conflicts": [],
-            "modified_count": 0,
-            "staged_count": 0,
-            "untracked_count": 0,
-            "stash_count": 1,
-            "extra_details": "HEAD is currently detached at commit d2e3f4a. 2 new commits were made here."
-        },
-        "intents": [
-            "I accidentally made commits in detached HEAD state, how do I keep them?",
-            "You are in 'detached HEAD' state. How do I turn this into a new branch?",
-            "Save my work from detached HEAD",
+    intents = [
+        f"Merge conflict in {', '.join(files)}, how do I inspect and fix?",
+        "Automatic merge failed, fix conflicts and continue",
+        f"I have merge conflicts while merging into {branch}",
+        "Merge stopped with conflicts, show me what to resolve",
+    ]
+
+    plan = {
+        "root_cause": f"Active merge conflict between {branch} and merged commit in {', '.join(files)}.",
+        "risk_tier": "MUTATING_SAFE",
+        "execution_steps": [
+            {
+                "cmd": "git status --short",
+                "explanation": "List conflicted files to inspect resolution state."
+            },
+            {
+                "cmd": "git diff --name-only --diff-filter=U",
+                "explanation": "Isolate all paths containing unresolved conflict markers."
+            }
         ],
-        "plan": {
-            "root_cause": "Commits were created while in detached HEAD state and will become unreachable if HEAD moves.",
-            "risk_tier": "Safe",
-            "execution_steps": [
-                {
-                    "step_number": 1,
-                    "command": "git branch tsugi-recovered-work",
-                    "rationale": "Attach a concrete named branch reference to the current commit to prevent garbage collection.",
-                    "requires_confirmation": False
-                },
-                {
-                    "step_number": 2,
-                    "command": "git switch tsugi-recovered-work",
-                    "rationale": "Re-attach HEAD to the newly created branch reference.",
-                    "requires_confirmation": False
-                }
-            ],
-            "rollback_plan": {
-                "steps": [
-                    {
-                        "step_number": 1,
-                        "command": "git checkout d2e3f4a",
-                        "rationale": "Return to the detached commit.",
-                        "requires_confirmation": False
-                    },
-                    {
-                        "step_number": 2,
-                        "command": "git branch -d tsugi-recovered-work",
-                        "rationale": "Delete temporary branch pointer.",
-                        "requires_confirmation": False
-                    }
-                ],
-                "explanation": "Removes the recovery branch and returns to detached HEAD."
-            },
-            "explanation": "Creates branch 'tsugi-recovered-work' pointing to your detached commits and switches to it so your work is safely preserved."
-        }
-    })
+        "rollback_cmd": "git merge --abort"
+    }
 
-    # 3. Dirty Working Tree Preventing Pull
-    scenarios.append({
-        "state": {
-            "branch": "main",
-            "is_detached": False,
-            "head_oid": "7c8b9d0",
-            "head_summary": "Bump dependencies",
-            "upstream": "origin/main",
-            "ahead": 0,
-            "behind": 4,
-            "operation": "None",
-            "conflicts": [],
-            "modified_count": 3,
-            "staged_count": 0,
-            "untracked_count": 1,
-            "stash_count": 0,
-            "extra_details": "Local modifications to config.yaml and src/main.rs would be overwritten by pull."
-        },
-        "intents": [
-            "Your local changes to the following files would be overwritten by merge: please commit your changes or stash them",
-            "Git pull fails because I have uncommitted files",
-            "Cannot pull latest main because of local edits",
+    return fact_sheet, rng.choice(intents), plan
+
+
+def incident_rebase_conflict(rng: random.Random) -> Tuple[str, str, Dict[str, Any]]:
+    branch = random_branch(rng)
+    sha = random_sha(rng)
+    conf_file = rng.choice(FILES)
+    step_cur = rng.randint(1, 4)
+    step_total = step_cur + rng.randint(1, 3)
+    interactive = rng.choice([True, False])
+    mode = "INTERACTIVE_REBASE" if interactive else "REBASE"
+
+    fact_sheet = format_repo_state(
+        head=f"DETACHED at {sha}",
+        ongoing_op=f"{mode} in progress (step {step_cur}/{step_total}) onto origin/main",
+        conflicts=[f'"{conf_file}" (both_modified)'],
+        staged="+0 ~0 -0 R0",
+        unstaged="~1 -0",
+        untracked=0,
+        tracking=f"origin/{branch} (ahead 3, behind 2)",
+        recent_commits=[f"{sha} {rng.choice(COMMIT_SUMMARIES)}"],
+        reflog=[f"0: {sha} rebase (step {step_cur}): conflict"]
+    )
+
+    intents = [
+        f"Rebase is paused due to conflict in {conf_file}",
+        "Fix rebase conflict and tell me how to inspect or abort",
+        "Could not apply commit during git rebase",
+        f"Rebase paused with conflict markers in {conf_file}",
+    ]
+
+    plan = {
+        "root_cause": f"Git rebase paused at step {step_cur}/{step_total} due to conflict in {conf_file}.",
+        "risk_tier": "MUTATING_SAFE",
+        "execution_steps": [
+            {
+                "cmd": f"git diff {conf_file}",
+                "explanation": f"Inspect conflict markers (<<<<<<< / ======= / >>>>>>>) in {conf_file}."
+            }
         ],
-        "plan": {
-            "root_cause": "Remote branch has new commits but local uncommitted changes prevent fast-forward checkout.",
-            "risk_tier": "Safe",
-            "execution_steps": [
-                {
-                    "step_number": 1,
-                    "command": "git stash push -u -m \"tsugi: auto-stash before pull\"",
-                    "rationale": "Stash both modified and untracked files safely away into git stash storage.",
-                    "requires_confirmation": False
-                },
-                {
-                    "step_number": 2,
-                    "command": "git pull --rebase",
-                    "rationale": "Replay local branch on top of updated upstream main.",
-                    "requires_confirmation": False
-                },
-                {
-                    "step_number": 3,
-                    "command": "git stash pop",
-                    "rationale": "Restore stashed local modifications on top of the newly updated code.",
-                    "requires_confirmation": False
-                }
-            ],
-            "rollback_plan": {
-                "steps": [
-                    {
-                        "step_number": 1,
-                        "command": "git reset --hard HEAD@{1}",
-                        "rationale": "Reset branch pointer back before rebase.",
-                        "requires_confirmation": False
-                    },
-                    {
-                        "step_number": 2,
-                        "command": "git stash pop",
-                        "rationale": "Reapply stashed modifications.",
-                        "requires_confirmation": False
-                    }
-                ],
-                "explanation": "Rolls back branch to pre-pull commit and reapplies original stash."
-            },
-            "explanation": "Temporarily stashes your local changes, updates the branch via rebase, and automatically re-applies your edits."
-        }
-    })
+        "rollback_cmd": "git rebase --abort"
+    }
 
-    # 4. Accidental Commit to Main
-    scenarios.append({
-        "state": {
-            "branch": "main",
-            "is_detached": False,
-            "head_oid": "3e4f5a6",
-            "head_summary": "WIP: experimental caching layer",
-            "upstream": "origin/main",
-            "ahead": 1,
-            "behind": 0,
-            "operation": "None",
-            "conflicts": [],
-            "modified_count": 0,
-            "staged_count": 0,
-            "untracked_count": 0,
-            "stash_count": 0,
-            "extra_details": "User accidentally committed directly to protected main branch instead of feature branch."
-        },
-        "intents": [
-            "I committed directly to main by accident, move this commit to a new branch",
-            "Accidentally committed to master instead of feature branch",
-            "Move last commit from main to feature/cache",
+    return fact_sheet, rng.choice(intents), plan
+
+
+def incident_rebase_clean_continue(rng: random.Random) -> Tuple[str, str, Dict[str, Any]]:
+    branch = random_branch(rng)
+    sha = random_sha(rng)
+    step_cur = rng.randint(2, 5)
+    step_total = step_cur + rng.randint(0, 2)
+    resolved_file = rng.choice(FILES)
+
+    fact_sheet = format_repo_state(
+        head=f"DETACHED at {sha}",
+        ongoing_op=f"REBASE in progress (step {step_cur}/{step_total}) onto origin/main",
+        conflicts=None,
+        staged="+0 ~1 -0 R0",
+        unstaged="~0 -0",
+        untracked=0,
+        tracking=f"origin/{branch} (ahead 2, behind 1)",
+        recent_commits=[f"{sha} {rng.choice(COMMIT_SUMMARIES)}"],
+        reflog=[f"0: {sha} rebase (step {step_cur}): continue"]
+    )
+
+    intents = [
+        f"I resolved the conflict in {resolved_file} and staged it, now continue the rebase",
+        "Conflicts are resolved, resume rebase",
+        "Continue git rebase after resolving conflicts",
+        "Finish current rebase step and proceed",
+    ]
+
+    plan = {
+        "root_cause": f"Rebase conflicts resolved and staged; rebase is ready to proceed to step {step_cur + 1}.",
+        "risk_tier": "MUTATING_SAFE",
+        "execution_steps": [
+            {
+                "cmd": "git rebase --continue",
+                "explanation": "Continue the rebase operation now that all conflicts are resolved."
+            }
         ],
-        "plan": {
-            "root_cause": "1 unpushed commit made on protected 'main' branch that belongs on a dedicated feature branch.",
-            "risk_tier": "Safe",
-            "execution_steps": [
-                {
-                    "step_number": 1,
-                    "command": "git branch feature/cache",
-                    "rationale": "Create new feature branch pointer at current commit so work is not lost.",
-                    "requires_confirmation": False
-                },
-                {
-                    "step_number": 2,
-                    "command": "git reset --hard origin/main",
-                    "rationale": "Reset local main back to matching origin/main without the experimental commit.",
-                    "requires_confirmation": False
-                },
-                {
-                    "step_number": 3,
-                    "command": "git switch feature/cache",
-                    "rationale": "Switch to new feature branch where the commit is preserved.",
-                    "requires_confirmation": False
-                }
-            ],
-            "rollback_plan": {
-                "steps": [
-                    {
-                        "step_number": 1,
-                        "command": "git switch main",
-                        "rationale": "Switch back to main.",
-                        "requires_confirmation": False
-                    },
-                    {
-                        "step_number": 2,
-                        "command": "git reset --hard feature/cache",
-                        "rationale": "Restore commit back to main.",
-                        "requires_confirmation": False
-                    },
-                    {
-                        "step_number": 3,
-                        "command": "git branch -d feature/cache",
-                        "rationale": "Delete feature branch.",
-                        "requires_confirmation": False
-                    }
-                ],
-                "explanation": "Restores the commit back onto main and removes the feature branch."
-            },
-            "explanation": "Moves the recent commit to 'feature/cache' and resets local 'main' to match origin/main."
-        }
-    })
+        "rollback_cmd": "git rebase --abort"
+    }
 
-    # 5. Paused Rebase with Conflicts
-    scenarios.append({
-        "state": {
-            "branch": "feature/auth",
-            "is_detached": True,
-            "head_oid": "99b8c7d",
-            "head_summary": "Add OAuth2 PKCE validation",
-            "upstream": "origin/feature/auth",
-            "ahead": 3,
-            "behind": 2,
-            "operation": "Rebase",
-            "conflicts": ["src/auth/pkce.rs"],
-            "modified_count": 0,
-            "staged_count": 0,
-            "untracked_count": 0,
-            "stash_count": 0,
-            "extra_details": "Interactive rebase paused at step 2 of 4 due to conflict in src/auth/pkce.rs."
-        },
-        "intents": [
-            "Rebase is stuck with conflicts, how do I continue or abort?",
-            "Could not apply 99b8c7d... Add OAuth2 PKCE validation",
-            "Fix rebase conflict",
+    return fact_sheet, rng.choice(intents), plan
+
+
+def incident_merge_clean_continue(rng: random.Random) -> Tuple[str, str, Dict[str, Any]]:
+    branch = random_branch(rng)
+    sha = random_sha(rng)
+    merge_sha = random_sha(rng)
+
+    fact_sheet = format_repo_state(
+        head=f"ATTACHED to {branch} ({sha})",
+        ongoing_op=f"MERGE in progress (merging {merge_sha})",
+        conflicts=None,
+        staged="+0 ~2 -0 R0",
+        unstaged="~0 -0",
+        untracked=0,
+        recent_commits=[f"{sha} {rng.choice(COMMIT_SUMMARIES)}"],
+        reflog=[f"0: {sha} merge commit in progress"]
+    )
+
+    intents = [
+        "All merge conflicts are resolved and staged, complete the merge",
+        "Finish merge commit",
+        "Complete merge in progress",
+    ]
+
+    plan = {
+        "root_cause": f"Merge from {merge_sha} has all changes staged with zero conflicts remaining.",
+        "risk_tier": "MUTATING_SAFE",
+        "execution_steps": [
+            {
+                "cmd": "git commit --no-edit",
+                "explanation": "Complete the in-progress merge commit using the default merge message."
+            }
         ],
-        "plan": {
-            "root_cause": "Git rebase paused due to conflict in src/auth/pkce.rs while applying commit 99b8c7d.",
-            "risk_tier": "Caution",
-            "execution_steps": [
-                {
-                    "step_number": 1,
-                    "command": "git diff src/auth/pkce.rs",
-                    "rationale": "Inspect conflict markers in the conflicted source file.",
-                    "requires_confirmation": False
-                }
-            ],
-            "rollback_plan": {
-                "steps": [
-                    {
-                        "step_number": 1,
-                        "command": "git rebase --abort",
-                        "rationale": "Abort rebase operation entirely and restore original branch state.",
-                        "requires_confirmation": False
-                    }
-                ],
-                "explanation": "Cancels the in-progress rebase and returns feature/auth to its starting point."
-            },
-            "explanation": "Rebase is paused at src/auth/pkce.rs. Resolve markers and run 'git rebase --continue', or run 'git rebase --abort' to cancel."
-        }
-    })
+        "rollback_cmd": "git merge --abort"
+    }
 
-    # 6. Lost Commit after git reset --hard (Reflog Recovery)
-    scenarios.append({
-        "state": {
-            "branch": "feature/ui",
-            "is_detached": False,
-            "head_oid": "1122334",
-            "head_summary": "Initial skeleton",
-            "upstream": "origin/feature/ui",
-            "ahead": 0,
-            "behind": 0,
-            "operation": "None",
-            "conflicts": [],
-            "modified_count": 0,
-            "staged_count": 0,
-            "untracked_count": 0,
-            "stash_count": 0,
-            "extra_details": "User ran git reset --hard and lost 3 unpushed commits. Reflog shows HEAD@{1} was 5566778 'Complete UI styling'."
-        },
-        "intents": [
-            "I accidentally ran git reset --hard and lost my commits, can I get them back?",
-            "Recover lost commits after hard reset",
-            "Undo git reset --hard HEAD~3",
+    return fact_sheet, rng.choice(intents), plan
+
+
+def incident_cherry_pick_conflict(rng: random.Random) -> Tuple[str, str, Dict[str, Any]]:
+    branch = random_branch(rng)
+    sha = random_sha(rng)
+    cp_sha = random_sha(rng)
+    conf_file = rng.choice(FILES)
+
+    fact_sheet = format_repo_state(
+        head=f"ATTACHED to {branch} ({sha})",
+        ongoing_op=f"CHERRY-PICK in progress ({cp_sha})",
+        conflicts=[f'"{conf_file}" (both_modified)'],
+        staged="+0 ~0 -0 R0",
+        unstaged="~1 -0",
+        untracked=0,
+        recent_commits=[f"{sha} {rng.choice(COMMIT_SUMMARIES)}"]
+    )
+
+    intents = [
+        f"Cherry-pick of {cp_sha[:7]} failed with conflict in {conf_file}",
+        "Conflict while cherry-picking commit",
+        f"Cherry pick stopped on conflict, show diff or abort",
+    ]
+
+    plan = {
+        "root_cause": f"Cherry-pick of {cp_sha[:7]} paused due to conflict in {conf_file}.",
+        "risk_tier": "MUTATING_SAFE",
+        "execution_steps": [
+            {
+                "cmd": f"git diff {conf_file}",
+                "explanation": f"View conflicting lines in {conf_file}."
+            }
         ],
-        "plan": {
-            "root_cause": "Hard reset displaced branch HEAD from 5566778 to 1122334. Commits still exist in reflog.",
-            "risk_tier": "Safe",
-            "execution_steps": [
-                {
-                    "step_number": 1,
-                    "command": "git branch recovered-ui-work HEAD@{1}",
-                    "rationale": "Create new branch at pre-reset reflog commit 5566778 to secure the lost commits.",
-                    "requires_confirmation": False
-                },
-                {
-                    "step_number": 2,
-                    "command": "git reset --hard HEAD@{1}",
-                    "rationale": "Restore current branch back to the pre-reset commit position.",
-                    "requires_confirmation": True
-                }
-            ],
-            "rollback_plan": {
-                "steps": [
-                    {
-                        "step_number": 1,
-                        "command": "git reset --hard 1122334",
-                        "rationale": "Re-point HEAD back to post-reset state.",
-                        "requires_confirmation": False
-                    }
-                ],
-                "explanation": "Returns HEAD to the commit prior to reflog restoration."
-            },
-            "explanation": "Identified your lost commits in Git reflog (HEAD@{1}). Restores branch HEAD and creates a backup branch 'recovered-ui-work'."
-        }
-    })
+        "rollback_cmd": "git cherry-pick --abort"
+    }
 
-    # 7. Stale index.lock file
-    scenarios.append({
-        "state": {
-            "branch": "main",
-            "is_detached": False,
-            "head_oid": "7788990",
-            "head_summary": "Update readme",
-            "upstream": "origin/main",
-            "ahead": 0,
-            "behind": 0,
-            "operation": "None",
-            "conflicts": [],
-            "modified_count": 0,
-            "staged_count": 0,
-            "untracked_count": 0,
-            "stash_count": 0,
-            "extra_details": "Fatal: Unable to create '.git/index.lock': File exists. Another git process seems to have crashed."
-        },
-        "intents": [
-            "Fatal: Unable to create '.git/index.lock': File exists",
-            "Git command blocked because index.lock exists",
-            "Remove stale git lock file",
+    return fact_sheet, rng.choice(intents), plan
+
+
+def incident_detached_head_dirty(rng: random.Random) -> Tuple[str, str, Dict[str, Any]]:
+    sha = random_sha(rng)
+    rec_branch = f"recovery/{sha}"
+
+    fact_sheet = format_repo_state(
+        head=f"DETACHED at {sha}",
+        ongoing_op="NONE",
+        staged="+0 ~0 -0 R0",
+        unstaged=f"~{rng.randint(1, 3)} -0",
+        untracked=rng.randint(0, 2),
+        stashes=rng.randint(0, 1),
+        recent_commits=[f"{sha} {rng.choice(COMMIT_SUMMARIES)}"]
+    )
+
+    intents = [
+        "I accidentally made changes in detached HEAD state, how do I save them?",
+        "You are in 'detached HEAD' state, turn this into a new branch",
+        "Save my work from detached HEAD",
+        "Keep detached HEAD commits on a real branch",
+    ]
+
+    plan = {
+        "root_cause": f"Working in detached HEAD at {sha} with uncommitted modifications.",
+        "risk_tier": "MUTATING_SAFE",
+        "execution_steps": [
+            {
+                "cmd": f"git switch -c {rec_branch}",
+                "explanation": f"Create and switch to branch '{rec_branch}' to preserve all work."
+            }
         ],
-        "plan": {
-            "root_cause": "A crashed or terminated Git process left behind an orphaned '.git/index.lock' file.",
-            "risk_tier": "Caution",
-            "execution_steps": [
-                {
-                    "step_number": 1,
-                    "command": "git status",
-                    "rationale": "Verify no active background git process is currently writing to the repository.",
-                    "requires_confirmation": False
-                }
-            ],
-            "rollback_plan": {
-                "steps": [],
-                "explanation": "Removing an orphaned lockfile cannot corrupt index data."
-            },
-            "explanation": "Removes the orphaned '.git/index.lock' created by a previous crashed git process so repository operations can resume."
-        }
-    })
+        "rollback_cmd": f"git switch - && git branch -D {rec_branch}"
+    }
 
-    # 8. Accidental Secret or Large File in Staging
-    scenarios.append({
-        "state": {
-            "branch": "feature/login",
-            "is_detached": False,
-            "head_oid": "4455667",
-            "head_summary": "Login page layout",
-            "upstream": "origin/feature/login",
-            "ahead": 0,
-            "behind": 0,
-            "operation": "None",
-            "conflicts": [],
-            "modified_count": 1,
-            "staged_count": 2,
-            "untracked_count": 0,
-            "stash_count": 0,
-            "extra_details": "Staged files include .env with AWS keys and client_secrets.json."
-        },
-        "intents": [
-            "I staged my .env file with secrets by mistake, unstage it before commit",
-            "Unstage .env without deleting file",
-            "How do I unstage sensitive file",
+    return fact_sheet, rng.choice(intents), plan
+
+
+def incident_detached_head_clean(rng: random.Random) -> Tuple[str, str, Dict[str, Any]]:
+    sha = random_sha(rng)
+
+    fact_sheet = format_repo_state(
+        head=f"DETACHED at {sha}",
+        ongoing_op="NONE",
+        staged="+0 ~0 -0 R0",
+        unstaged="~0 -0",
+        untracked=0,
+        recent_commits=[f"{sha} {rng.choice(COMMIT_SUMMARIES)}"]
+    )
+
+    intents = [
+        "I am in detached HEAD, take me back to my previous branch",
+        "How do I exit detached HEAD mode?",
+        "Get me out of detached HEAD",
+        "Return to the branch I was working on before",
+    ]
+
+    plan = {
+        "root_cause": f"HEAD is detached at commit {sha} with a clean working tree.",
+        "risk_tier": "READ_ONLY",
+        "execution_steps": [
+            {
+                "cmd": "git switch -",
+                "explanation": "Switch back to the previously checked-out branch."
+            }
         ],
-        "plan": {
-            "root_cause": "Sensitive environment file (.env) staged for commit.",
-            "risk_tier": "Safe",
-            "execution_steps": [
-                {
-                    "step_number": 1,
-                    "command": "git restore --staged .env client_secrets.json",
-                    "rationale": "Remove files from the Git staging area while keeping their contents on disk untouched.",
-                    "requires_confirmation": False
-                }
-            ],
-            "rollback_plan": {
-                "steps": [
-                    {
-                        "step_number": 1,
-                        "command": "git add .env client_secrets.json",
-                        "rationale": "Re-stage files.",
-                        "requires_confirmation": False
-                    }
-                ],
-                "explanation": "Re-adds files to the index."
-            },
-            "explanation": "Safely removes .env and client_secrets.json from git staging without modifying the actual files on disk."
-        }
-    })
+        "rollback_cmd": f"git checkout {sha}"
+    }
 
-    # 9. Diverged Branch (Need Rebase vs Force Push)
-    scenarios.append({
-        "state": {
-            "branch": "feature/search",
-            "is_detached": False,
-            "head_oid": "aabbccd",
-            "head_summary": "Refactor elasticsearch client",
-            "upstream": "origin/feature/search",
-            "ahead": 2,
-            "behind": 3,
-            "operation": "None",
-            "conflicts": [],
-            "modified_count": 0,
-            "staged_count": 0,
-            "untracked_count": 0,
-            "stash_count": 0,
-            "extra_details": "Remote branch has diverged. git push rejected (non-fast-forward)."
-        },
-        "intents": [
-            "Updates were rejected because the tip of your current branch is behind its remote counterpart",
-            "Git push rejected non fast forward",
-            "How do I sync diverged branch with origin",
+    return fact_sheet, rng.choice(intents), plan
+
+
+def incident_dirty_tree_preventing_pull(rng: random.Random) -> Tuple[str, str, Dict[str, Any]]:
+    branch = random_branch(rng)
+    sha = random_sha(rng)
+    mod_file = rng.choice(FILES)
+
+    fact_sheet = format_repo_state(
+        head=f"ATTACHED to {branch} ({sha})",
+        ongoing_op="NONE",
+        staged="+0 ~0 -0 R0",
+        unstaged="~2 -0",
+        untracked=1,
+        tracking=f"origin/{branch} (ahead 0, behind {rng.randint(2, 5)})",
+        recent_commits=[f"{sha} {rng.choice(COMMIT_SUMMARIES)}"]
+    )
+
+    intents = [
+        f"Your local changes to {mod_file} would be overwritten by merge, please commit or stash them",
+        "Git pull fails because I have uncommitted local changes",
+        "Cannot pull upstream because of modified files",
+        "Safely update branch while keeping local uncommitted changes",
+    ]
+
+    plan = {
+        "root_cause": "Local uncommitted changes prevent fast-forward or rebase pull from remote.",
+        "risk_tier": "MUTATING_SAFE",
+        "execution_steps": [
+            {
+                "cmd": 'git stash push -u -m "tsugi: auto-stash before pull"',
+                "explanation": "Safely stash modified and untracked files away."
+            },
+            {
+                "cmd": "git pull --rebase",
+                "explanation": "Replay local branch on top of updated upstream."
+            },
+            {
+                "cmd": "git stash pop",
+                "explanation": "Re-apply stashed modifications on top of updated code."
+            }
         ],
-        "plan": {
-            "root_cause": "Local branch and remote tracking branch have diverged (2 ahead, 3 behind).",
-            "risk_tier": "Safe",
-            "execution_steps": [
-                {
-                    "step_number": 1,
-                    "command": "git pull --rebase origin feature/search",
-                    "rationale": "Fetch remote commits and replay local 2 commits on top to create a clean linear history.",
-                    "requires_confirmation": False
-                }
-            ],
-            "rollback_plan": {
-                "steps": [
-                    {
-                        "step_number": 1,
-                        "command": "git reset --hard HEAD@{1}",
-                        "rationale": "Reset local branch pointer to pre-pull state.",
-                        "requires_confirmation": False
-                    }
-                ],
-                "explanation": "Restores branch head to state prior to rebase."
-            },
-            "explanation": "Rebases your 2 local commits on top of the 3 remote commits to resolve non-fast-forward rejection cleanly."
-        }
-    })
+        "rollback_cmd": "git reset --hard HEAD@{1} && git stash pop"
+    }
 
-    # 10. Untracked file collision blocking checkout
-    scenarios.append({
-        "state": {
-            "branch": "main",
-            "is_detached": False,
-            "head_oid": "eeff112",
-            "head_summary": "Release v1.2.0",
-            "upstream": "origin/main",
-            "ahead": 0,
-            "behind": 0,
-            "operation": "None",
-            "conflicts": [],
-            "modified_count": 0,
-            "staged_count": 0,
-            "untracked_count": 1,
-            "stash_count": 0,
-            "extra_details": "Untracked working tree file 'build.log' would be overwritten by checkout."
-        },
-        "intents": [
-            "The following untracked working tree files would be overwritten by checkout",
-            "Cannot switch branch because untracked file exists",
-            "Branch switch blocked by untracked file",
+    return fact_sheet, rng.choice(intents), plan
+
+
+def incident_accidental_commit_on_main(rng: random.Random) -> Tuple[str, str, Dict[str, Any]]:
+    sha = random_sha(rng)
+    feat_branch = random_branch(rng)
+    main_name = rng.choice(["main", "master"])
+
+    fact_sheet = format_repo_state(
+        head=f"ATTACHED to {main_name} ({sha})",
+        ongoing_op="NONE",
+        staged="+0 ~0 -0 R0",
+        unstaged="~0 -0",
+        untracked=0,
+        tracking=f"origin/{main_name} (ahead 1, behind 0)",
+        recent_commits=[
+            f"{sha} {rng.choice(COMMIT_SUMMARIES)}",
+            f"{random_sha(rng)} Previous stable commit"
+        ]
+    )
+
+    intents = [
+        f"I committed directly to {main_name} by accident, move this commit to {feat_branch}",
+        f"Accidentally committed on {main_name}, move commit to new feature branch",
+        f"Move latest commit from {main_name} to {feat_branch} and reset {main_name} to match origin",
+    ]
+
+    plan = {
+        "root_cause": f"1 unpushed commit made on protected '{main_name}' branch that belongs on a feature branch.",
+        "risk_tier": "MUTATING_SAFE",
+        "execution_steps": [
+            {
+                "cmd": f"git branch {feat_branch}",
+                "explanation": f"Create '{feat_branch}' at current HEAD so commit is preserved."
+            },
+            {
+                "cmd": f"git reset --hard origin/{main_name}",
+                "explanation": f"Reset local {main_name} back to match remote origin/{main_name} cleanly."
+            },
+            {
+                "cmd": f"git switch {feat_branch}",
+                "explanation": f"Switch to '{feat_branch}' where the commit is now located."
+            }
         ],
-        "plan": {
-            "root_cause": "An untracked local file shares a path with a tracked file in the target branch.",
-            "risk_tier": "Safe",
-            "execution_steps": [
-                {
-                    "step_number": 1,
-                    "command": "git stash push -u -m \"tsugi: stash untracked files before branch switch\"",
-                    "rationale": "Safely stash untracked files instead of deleting them.",
-                    "requires_confirmation": False
-                }
-            ],
-            "rollback_plan": {
-                "steps": [
-                    {
-                        "step_number": 1,
-                        "command": "git stash pop",
-                        "rationale": "Restore untracked file to working directory.",
-                        "requires_confirmation": False
-                    }
-                ],
-                "explanation": "Pops the stash back into the working tree."
+        "rollback_cmd": f"git switch {main_name} && git reset --hard {feat_branch}"
+    }
+
+    return fact_sheet, rng.choice(intents), plan
+
+
+def incident_diverged_branch(rng: random.Random) -> Tuple[str, str, Dict[str, Any]]:
+    branch = random_branch(rng)
+    sha = random_sha(rng)
+    ahead = rng.randint(1, 3)
+    behind = rng.randint(2, 6)
+
+    fact_sheet = format_repo_state(
+        head=f"ATTACHED to {branch} ({sha})",
+        ongoing_op="NONE",
+        staged="+0 ~0 -0 R0",
+        unstaged="~0 -0",
+        untracked=0,
+        tracking=f"origin/{branch} (ahead {ahead}, behind {behind})",
+        recent_commits=[f"{sha} {rng.choice(COMMIT_SUMMARIES)}"]
+    )
+
+    intents = [
+        "Updates were rejected because the tip of your current branch is behind its remote counterpart",
+        "Git push rejected non fast forward",
+        f"How do I sync diverged {branch} with origin without destroying my commits?",
+        "Branch diverged, pull changes cleanly",
+    ]
+
+    plan = {
+        "root_cause": f"Local branch and remote tracking branch have diverged ({ahead} ahead, {behind} behind).",
+        "risk_tier": "MUTATING_SAFE",
+        "execution_steps": [
+            {
+                "cmd": f"git pull --rebase origin {branch}",
+                "explanation": f"Fetch remote commits and replay local {ahead} commit(s) on top for clean linear history."
+            }
+        ],
+        "rollback_cmd": "git reset --hard ORIG_HEAD"
+    }
+
+    return fact_sheet, rng.choice(intents), plan
+
+
+def incident_reflog_hard_reset_recovery(rng: random.Random) -> Tuple[str, str, Dict[str, Any]]:
+    branch = random_branch(rng)
+    current_sha = random_sha(rng)
+    lost_sha = random_sha(rng)
+    rec_branch = f"recovered-work-{current_sha[:4]}"
+
+    fact_sheet = format_repo_state(
+        head=f"ATTACHED to {branch} ({current_sha})",
+        ongoing_op="NONE",
+        staged="+0 ~0 -0 R0",
+        unstaged="~0 -0",
+        untracked=0,
+        safe_rollback_target=f"HEAD@{{1}} ({lost_sha})",
+        recent_commits=[f"{current_sha} Old commit"],
+        reflog=[
+            f"0: {current_sha} reset: moving to HEAD~3",
+            f"1: {lost_sha} commit: {rng.choice(COMMIT_SUMMARIES)}"
+        ]
+    )
+
+    intents = [
+        "I accidentally ran git reset --hard and lost my unpushed commits, can I get them back?",
+        "Recover lost commits after hard reset",
+        "Undo git reset --hard HEAD~3",
+        "Reflog recovery for deleted commits",
+    ]
+
+    plan = {
+        "root_cause": f"Hard reset displaced branch HEAD from {lost_sha} to {current_sha}; commits still exist in reflog.",
+        "risk_tier": "MUTATING_DANGEROUS",
+        "execution_steps": [
+            {
+                "cmd": f"git branch {rec_branch} HEAD@{{1}}",
+                "explanation": f"Create safety branch '{rec_branch}' pointing to lost commit {lost_sha}."
             },
-            "explanation": "Safely stashes untracked files so the branch switch can proceed without destroying data."
-        }
-    })
+            {
+                "cmd": "git reset --hard HEAD@{1}",
+                "explanation": f"Restore current branch HEAD back to pre-reset commit {lost_sha}."
+            }
+        ],
+        "rollback_cmd": f"git reset --hard {current_sha}"
+    }
 
-    return scenarios
+    return fact_sheet, rng.choice(intents), plan
 
 
-def build_chatml_dataset(output_file: Path, total_examples: int = 500) -> None:
-    scenarios = generate_scenarios()
+def incident_sensitive_staged_file(rng: random.Random) -> Tuple[str, str, Dict[str, Any]]:
+    branch = random_branch(rng)
+    sha = random_sha(rng)
+    secret = rng.choice(SECRET_FILES)
+
+    fact_sheet = format_repo_state(
+        head=f"ATTACHED to {branch} ({sha})",
+        ongoing_op="NONE",
+        staged="+1 ~0 -0 R0",
+        unstaged="~1 -0",
+        untracked=0,
+        recent_commits=[f"{sha} {rng.choice(COMMIT_SUMMARIES)}"]
+    )
+
+    intents = [
+        f"I staged {secret} with API keys by mistake, unstage it before commit",
+        f"Unstage {secret} without deleting the file from disk",
+        "How do I unstage sensitive credentials before committing?",
+        f"Remove {secret} from git index",
+    ]
+
+    plan = {
+        "root_cause": f"Sensitive file '{secret}' was inadvertently staged for commit.",
+        "risk_tier": "READ_ONLY",
+        "execution_steps": [
+            {
+                "cmd": f"git restore --staged {secret}",
+                "explanation": f"Remove '{secret}' from the Git staging index while keeping disk contents intact."
+            }
+        ],
+        "rollback_cmd": f"git add {secret}"
+    }
+
+    return fact_sheet, rng.choice(intents), plan
+
+
+def incident_untracked_collision_switch(rng: random.Random) -> Tuple[str, str, Dict[str, Any]]:
+    branch = random_branch(rng)
+    target = rng.choice(["main", "develop", "staging"])
+    sha = random_sha(rng)
+    file_name = rng.choice(FILES)
+
+    fact_sheet = format_repo_state(
+        head=f"ATTACHED to {branch} ({sha})",
+        ongoing_op="NONE",
+        staged="+0 ~0 -0 R0",
+        unstaged="~0 -0",
+        untracked=1,
+        recent_commits=[f"{sha} {rng.choice(COMMIT_SUMMARIES)}"]
+    )
+
+    intents = [
+        f"The following untracked working tree files would be overwritten by checkout: {file_name}",
+        f"Cannot switch to {target} because untracked file exists",
+        "Branch switch blocked by untracked file",
+    ]
+
+    plan = {
+        "root_cause": f"Untracked local file '{file_name}' collides with a tracked file in target branch.",
+        "risk_tier": "MUTATING_SAFE",
+        "execution_steps": [
+            {
+                "cmd": 'git stash push -u -m "tsugi: stash untracked before switch"',
+                "explanation": "Safely stash untracked files into stash storage instead of deleting."
+            },
+            {
+                "cmd": f"git switch {target}",
+                "explanation": f"Switch to target branch '{target}' cleanly."
+            }
+        ],
+        "rollback_cmd": f"git switch {branch} && git stash pop"
+    }
+
+    return fact_sheet, rng.choice(intents), plan
+
+
+def incident_no_upstream_push(rng: random.Random) -> Tuple[str, str, Dict[str, Any]]:
+    branch = random_branch(rng)
+    sha = random_sha(rng)
+
+    fact_sheet = format_repo_state(
+        head=f"ATTACHED to {branch} ({sha})",
+        ongoing_op="NONE",
+        staged="+0 ~0 -0 R0",
+        unstaged="~0 -0",
+        untracked=0,
+        recent_commits=[f"{sha} {rng.choice(COMMIT_SUMMARIES)}"]
+    )
+
+    intents = [
+        "The current branch has no upstream branch. To push, use git push --set-upstream",
+        "How do I push a newly created local branch?",
+        "Git push fails with fatal: The current branch has no upstream branch",
+        "Publish new branch to remote origin",
+    ]
+
+    plan = {
+        "root_cause": f"Local branch '{branch}' has no remote tracking branch configured.",
+        "risk_tier": "MUTATING_SAFE",
+        "execution_steps": [
+            {
+                "cmd": f"git push --set-upstream origin {branch}",
+                "explanation": f"Push '{branch}' to origin and configure upstream tracking."
+            }
+        ],
+        "rollback_cmd": f"git push origin --delete {branch}"
+    }
+
+    return fact_sheet, rng.choice(intents), plan
+
+
+def incident_undo_last_commit(rng: random.Random) -> Tuple[str, str, Dict[str, Any]]:
+    branch = random_branch(rng)
+    sha = random_sha(rng)
+
+    fact_sheet = format_repo_state(
+        head=f"ATTACHED to {branch} ({sha})",
+        ongoing_op="NONE",
+        staged="+0 ~0 -0 R0",
+        unstaged="~0 -0",
+        untracked=0,
+        recent_commits=[f"{sha} {rng.choice(COMMIT_SUMMARIES)}"]
+    )
+
+    intents = [
+        "Undo last commit but keep my changes in the working directory",
+        "Uncommit previous commit without losing edits",
+        "How do I undo my last commit?",
+        "Soft reset last commit",
+    ]
+
+    plan = {
+        "root_cause": "User requested to reverse the last commit while preserving changes as unstaged edits.",
+        "risk_tier": "MUTATING_SAFE",
+        "execution_steps": [
+            {
+                "cmd": "git reset HEAD~1",
+                "explanation": "Move HEAD back one commit; changes are preserved as unstaged modifications."
+            }
+        ],
+        "rollback_cmd": "git commit -C ORIG_HEAD"
+    }
+
+    return fact_sheet, rng.choice(intents), plan
+
+
+def incident_force_push_lease(rng: random.Random) -> Tuple[str, str, Dict[str, Any]]:
+    branch = random_branch(rng)
+    sha = random_sha(rng)
+
+    fact_sheet = format_repo_state(
+        head=f"ATTACHED to {branch} ({sha})",
+        ongoing_op="NONE",
+        staged="+0 ~0 -0 R0",
+        unstaged="~0 -0",
+        untracked=0,
+        tracking=f"origin/{branch} (ahead 1, behind 1)",
+        recent_commits=[f"{sha} Rebased feature commit"]
+    )
+
+    intents = [
+        "Force push my rebased feature branch to remote",
+        f"I rebased {branch}, how do I push safely?",
+        "Update remote branch after interactive rebase",
+        "Force push without overwriting teammates' work",
+    ]
+
+    plan = {
+        "root_cause": f"Rebased history on '{branch}' requires force push to remote.",
+        "risk_tier": "HISTORY_REWRITE",
+        "execution_steps": [
+            {
+                "cmd": f"git push --force-with-lease origin {branch}",
+                "explanation": f"Push rewritten history to '{branch}' using --force-with-lease to protect remote commits."
+            }
+        ],
+        "rollback_cmd": f"git push origin {branch} --force-with-lease"
+    }
+
+    return fact_sheet, rng.choice(intents), plan
+
+
+def incident_amend_last_commit(rng: random.Random) -> Tuple[str, str, Dict[str, Any]]:
+    branch = random_branch(rng)
+    sha = random_sha(rng)
+    staged_file = rng.choice(FILES)
+
+    fact_sheet = format_repo_state(
+        head=f"ATTACHED to {branch} ({sha})",
+        ongoing_op="NONE",
+        staged="+0 ~1 -0 R0",
+        unstaged="~0 -0",
+        untracked=0,
+        recent_commits=[f"{sha} {rng.choice(COMMIT_SUMMARIES)}"]
+    )
+
+    intents = [
+        f"I forgot to include {staged_file} in the previous commit, add it without making a new commit",
+        "Amend last commit with staged changes",
+        "Combine staged change into the most recent commit",
+        "Add missed file to last commit",
+    ]
+
+    plan = {
+        "root_cause": f"Staged modification in '{staged_file}' intended for absorption into previous commit.",
+        "risk_tier": "MUTATING_SAFE",
+        "execution_steps": [
+            {
+                "cmd": "git commit --amend --no-edit",
+                "explanation": "Incorporate currently staged changes into the HEAD commit without editing the commit message."
+            }
+        ],
+        "rollback_cmd": "git reset --soft HEAD@{1}"
+    }
+
+    return fact_sheet, rng.choice(intents), plan
+
+
+def incident_unborn_repo_first_commit(rng: random.Random) -> Tuple[str, str, Dict[str, Any]]:
+    branch = rng.choice(["main", "master"])
+
+    fact_sheet = format_repo_state(
+        head=f"UNBORN ({branch}, no commits yet)",
+        ongoing_op="NONE",
+        staged="+0 ~0 -0 R0",
+        unstaged="~0 -0",
+        untracked=rng.randint(2, 5),
+    )
+
+    intents = [
+        "Brand new repository, create the initial commit",
+        "How do I make my first commit in this empty repo?",
+        "Initial commit with project files",
+        "Track files and commit in unborn repo",
+    ]
+
+    plan = {
+        "root_cause": "Empty Git repository with untracked files awaiting initial commit.",
+        "risk_tier": "MUTATING_SAFE",
+        "execution_steps": [
+            {
+                "cmd": "git add .",
+                "explanation": "Stage all workspace files for the initial commit."
+            },
+            {
+                "cmd": 'git commit -m "Initial commit"',
+                "explanation": "Create the root commit of the repository."
+            }
+        ],
+        "rollback_cmd": "git rm -r --cached ."
+    }
+
+    return fact_sheet, rng.choice(intents), plan
+
+
+def incident_discard_unstaged_file(rng: random.Random) -> Tuple[str, str, Dict[str, Any]]:
+    branch = random_branch(rng)
+    sha = random_sha(rng)
+    file_name = rng.choice(FILES)
+
+    fact_sheet = format_repo_state(
+        head=f"ATTACHED to {branch} ({sha})",
+        ongoing_op="NONE",
+        staged="+0 ~0 -0 R0",
+        unstaged="~1 -0",
+        untracked=0,
+        recent_commits=[f"{sha} {rng.choice(COMMIT_SUMMARIES)}"]
+    )
+
+    intents = [
+        f"Discard changes in {file_name} and revert it back to HEAD",
+        f"Undo unstaged edits in {file_name}",
+        f"Revert {file_name} to clean version",
+        f"Throw away modifications in {file_name}",
+    ]
+
+    plan = {
+        "root_cause": f"Unstaged modifications in '{file_name}' to be discarded.",
+        "risk_tier": "MUTATING_SAFE",
+        "execution_steps": [
+            {
+                "cmd": f"git restore {file_name}",
+                "explanation": f"Discard unstaged working directory changes in '{file_name}', restoring it to HEAD."
+            }
+        ],
+        "rollback_cmd": "git status"
+    }
+
+    return fact_sheet, rng.choice(intents), plan
+
+
+def incident_bisect_abort(rng: random.Random) -> Tuple[str, str, Dict[str, Any]]:
+    sha = random_sha(rng)
+
+    fact_sheet = format_repo_state(
+        head=f"DETACHED at {sha}",
+        ongoing_op="BISECT in progress",
+        staged="+0 ~0 -0 R0",
+        unstaged="~0 -0",
+        untracked=0,
+        recent_commits=[f"{sha} Testing bisect step"]
+    )
+
+    intents = [
+        "Stop git bisect and return to my branch",
+        "Cancel bisect session",
+        "Abort git bisect",
+        "End bisecting",
+    ]
+
+    plan = {
+        "root_cause": "Active git bisect session that user wishes to cancel.",
+        "risk_tier": "MUTATING_SAFE",
+        "execution_steps": [
+            {
+                "cmd": "git bisect reset",
+                "explanation": "End the bisect session and return HEAD to the original branch before bisecting."
+            }
+        ],
+        "rollback_cmd": "git bisect reset"
+    }
+
+    return fact_sheet, rng.choice(intents), plan
+
+
+INCIDENT_GENERATORS = [
+    incident_merge_conflict,
+    incident_rebase_conflict,
+    incident_rebase_clean_continue,
+    incident_merge_clean_continue,
+    incident_cherry_pick_conflict,
+    incident_detached_head_dirty,
+    incident_detached_head_clean,
+    incident_dirty_tree_preventing_pull,
+    incident_accidental_commit_on_main,
+    incident_diverged_branch,
+    incident_reflog_hard_reset_recovery,
+    incident_sensitive_staged_file,
+    incident_untracked_collision_switch,
+    incident_no_upstream_push,
+    incident_undo_last_commit,
+    incident_force_push_lease,
+    incident_amend_last_commit,
+    incident_unborn_repo_first_commit,
+    incident_discard_unstaged_file,
+    incident_bisect_abort,
+]
+
+
+def build_chatml_dataset(output_file: Path, total_examples: int = 5000, seed: int = 42) -> None:
+    """Generate high-diversity, schema-aligned ChatML training dataset."""
+    rng = random.Random(seed)
     dataset = []
+    seen_prompts = set()
 
     for i in range(total_examples):
-        base = random.choice(scenarios)
-        intent = random.choice(base["intents"])
-        state = dict(base["state"])
+        generator = rng.choice(INCIDENT_GENERATORS)
+        fact_sheet, intent, plan = generator(rng)
 
-        # Add minor deterministic variations
-        state["head_oid"] = f"{random.randint(0x1000000, 0xfffffff):07x}"
-        repo_state_fact_sheet = format_repo_state(state)
+        user_content = f"{fact_sheet}\n\nUSER_INTENT: {intent}"
+        assistant_content = json.dumps(plan, indent=2)
 
-        user_content = f"{repo_state_fact_sheet}\n\nUser Intent: {intent}"
-        assistant_content = json.dumps(base["plan"], indent=2)
+        prompt_key = (fact_sheet, intent)
+        if prompt_key in seen_prompts:
+            # Re-generate with fresh jitter to maintain uniqueness
+            continue
+        seen_prompts.add(prompt_key)
 
         chatml_entry = {
-            "id": f"tsugi-train-{i:05d}",
+            "id": f"tsugi-train-{len(dataset):05d}",
             "messages": [
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_content},
@@ -637,9 +991,9 @@ def build_chatml_dataset(output_file: Path, total_examples: int = 500) -> None:
         for entry in dataset:
             f.write(json.dumps(entry) + "\n")
 
-    print(f"Generated {len(dataset)} training examples -> {output_file}")
+    print(f"Generated {len(dataset)} unique training examples -> {output_file}")
 
 
 if __name__ == "__main__":
     out_path = Path(__file__).parent / "dataset" / "tsugi_train.jsonl"
-    build_chatml_dataset(out_path, total_examples=500)
+    build_chatml_dataset(out_path, total_examples=5000)
