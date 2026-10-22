@@ -280,7 +280,7 @@ fn cmd_undo(repo_path: &PathBuf) -> Result<()> {
     let config = load_config().unwrap_or_default();
     let engine = TsugiEngine::new(config)?;
 
-    let snapshot = engine.vault().get_latest_snapshot()
+    let snapshot = engine.vault().get_latest_snapshot_for_repo(repo_path)
         .context("Failed to query snapshots")?;
 
     match snapshot {

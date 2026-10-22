@@ -249,6 +249,10 @@ pub struct SnapshotRecord {
     /// Timestamp when the snapshot was taken.
     pub timestamp: String,
 
+    /// Absolute path to the repository root.
+    #[serde(default)]
+    pub repo_path: String,
+
     /// HEAD SHA at snapshot time.
     pub head_sha: String,
 

@@ -85,8 +85,8 @@ impl Ledger {
     pub fn insert_snapshot(&self, snapshot: &SnapshotRecord) -> Result<(), TsugiError> {
         self.conn
             .execute(
-                "INSERT INTO snapshots (id, timestamp, head_sha, stash_sha, plan_summary, rolled_back)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO snapshots (id, timestamp, head_sha, stash_sha, plan_summary, rolled_back, repo_path)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     snapshot.id,
                     snapshot.timestamp,
@@ -94,6 +94,7 @@ impl Ledger {
                     snapshot.stash_sha,
                     snapshot.plan_summary,
                     snapshot.rolled_back as i32,
+                    snapshot.repo_path,
                 ],
             )
             .map_err(|e| TsugiError::LedgerError(format!("Failed to insert snapshot: {e}")))?;
@@ -113,28 +114,45 @@ impl Ledger {
         Ok(())
     }
 
-    /// Get the most recent snapshot (for `tsugi undo`).
-    pub fn get_latest_snapshot(&self) -> Result<Option<SnapshotRecord>, TsugiError> {
-        let mut stmt = self
-            .conn
-            .prepare(
-                "SELECT id, timestamp, head_sha, stash_sha, plan_summary, rolled_back
+    /// Get the most recent un-reverted snapshot, optionally filtered by repository path (for `tsugi undo`).
+    pub fn get_latest_snapshot(&self, repo_path: Option<&str>) -> Result<Option<SnapshotRecord>, TsugiError> {
+        let (query, params): (&str, Vec<Box<dyn rusqlite::types::ToSql>>) = if let Some(path) = repo_path {
+            (
+                "SELECT id, timestamp, repo_path, head_sha, stash_sha, plan_summary, rolled_back
+                 FROM snapshots
+                 WHERE rolled_back = 0 AND repo_path = ?1
+                 ORDER BY timestamp DESC
+                 LIMIT 1",
+                vec![Box::new(path.to_string())],
+            )
+        } else {
+            (
+                "SELECT id, timestamp, repo_path, head_sha, stash_sha, plan_summary, rolled_back
                  FROM snapshots
                  WHERE rolled_back = 0
                  ORDER BY timestamp DESC
                  LIMIT 1",
+                vec![],
             )
+        };
+
+        let mut stmt = self
+            .conn
+            .prepare(query)
             .map_err(|e| TsugiError::LedgerError(format!("Failed to query snapshots: {e}")))?;
 
+        let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+
         let result = stmt
-            .query_row([], |row| {
+            .query_row(param_refs.as_slice(), |row| {
                 Ok(SnapshotRecord {
                     id: row.get(0)?,
                     timestamp: row.get(1)?,
-                    head_sha: row.get(2)?,
-                    stash_sha: row.get(3)?,
-                    plan_summary: row.get(4)?,
-                    rolled_back: row.get::<_, i32>(5)? != 0,
+                    repo_path: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                    head_sha: row.get(3)?,
+                    stash_sha: row.get(4)?,
+                    plan_summary: row.get(5)?,
+                    rolled_back: row.get::<_, i32>(6)? != 0,
                 })
             })
             .ok();
@@ -147,7 +165,7 @@ impl Ledger {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT id, timestamp, head_sha, stash_sha, plan_summary, rolled_back
+                "SELECT id, timestamp, repo_path, head_sha, stash_sha, plan_summary, rolled_back
                  FROM snapshots
                  WHERE timestamp < ?1
                  ORDER BY timestamp ASC",
@@ -159,10 +177,11 @@ impl Ledger {
                 Ok(SnapshotRecord {
                     id: row.get(0)?,
                     timestamp: row.get(1)?,
-                    head_sha: row.get(2)?,
-                    stash_sha: row.get(3)?,
-                    plan_summary: row.get(4)?,
-                    rolled_back: row.get::<_, i32>(5)? != 0,
+                    repo_path: row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                    head_sha: row.get(3)?,
+                    stash_sha: row.get(4)?,
+                    plan_summary: row.get(5)?,
+                    rolled_back: row.get::<_, i32>(6)? != 0,
                 })
             })
             .map_err(|e| TsugiError::LedgerError(format!("Failed to iterate snapshots: {e}")))?;
@@ -318,6 +337,7 @@ mod tests {
         let snapshot = SnapshotRecord {
             id: "test-id-123".to_string(),
             timestamp: "2025-01-01T00:00:00Z".to_string(),
+            repo_path: "/tmp/repo_a".to_string(),
             head_sha: "abc1234".to_string(),
             stash_sha: Some("def5678".to_string()),
             plan_summary: "Test snapshot".to_string(),
@@ -326,9 +346,16 @@ mod tests {
 
         ledger.insert_snapshot(&snapshot).unwrap();
 
-        let latest = ledger.get_latest_snapshot().unwrap();
+        let latest = ledger.get_latest_snapshot(None).unwrap();
         assert!(latest.is_some());
         assert_eq!(latest.unwrap().id, "test-id-123");
+
+        let repo_a_latest = ledger.get_latest_snapshot(Some("/tmp/repo_a")).unwrap();
+        assert!(repo_a_latest.is_some());
+        assert_eq!(repo_a_latest.unwrap().id, "test-id-123");
+
+        let repo_b_latest = ledger.get_latest_snapshot(Some("/tmp/repo_b")).unwrap();
+        assert!(repo_b_latest.is_none());
     }
 
     #[test]
@@ -340,6 +367,7 @@ mod tests {
         let snapshot = SnapshotRecord {
             id: "rollback-test".to_string(),
             timestamp: "2025-01-01T00:00:00Z".to_string(),
+            repo_path: "/tmp/repo_a".to_string(),
             head_sha: "abc1234".to_string(),
             stash_sha: None,
             plan_summary: "Test".to_string(),
@@ -350,8 +378,51 @@ mod tests {
         ledger.mark_rolled_back("rollback-test").unwrap();
 
         // After rollback, get_latest_snapshot should return None (filtered out)
-        let latest = ledger.get_latest_snapshot().unwrap();
+        let latest = ledger.get_latest_snapshot(None).unwrap();
         assert!(latest.is_none());
+    }
+
+    #[test]
+    fn test_cross_repository_snapshot_isolation() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("test_ledger.sqlite");
+        let ledger = Ledger::open(&db_path).unwrap();
+
+        let snapshot_a = SnapshotRecord {
+            id: "snap-repo-a".to_string(),
+            timestamp: "2025-01-01T10:00:00Z".to_string(),
+            repo_path: "/repos/project_a".to_string(),
+            head_sha: "commit_a".to_string(),
+            stash_sha: None,
+            plan_summary: "Fix in A".to_string(),
+            rolled_back: false,
+        };
+        let snapshot_b = SnapshotRecord {
+            id: "snap-repo-b".to_string(),
+            timestamp: "2025-01-01T11:00:00Z".to_string(),
+            repo_path: "/repos/project_b".to_string(),
+            head_sha: "commit_b".to_string(),
+            stash_sha: None,
+            plan_summary: "Fix in B".to_string(),
+            rolled_back: false,
+        };
+
+        ledger.insert_snapshot(&snapshot_a).unwrap();
+        ledger.insert_snapshot(&snapshot_b).unwrap();
+
+        // Querying project_a should only return snapshot_a, even though snapshot_b is newer
+        let latest_a = ledger.get_latest_snapshot(Some("/repos/project_a")).unwrap();
+        assert!(latest_a.is_some());
+        assert_eq!(latest_a.unwrap().id, "snap-repo-a");
+
+        // Querying project_b should return snapshot_b
+        let latest_b = ledger.get_latest_snapshot(Some("/repos/project_b")).unwrap();
+        assert!(latest_b.is_some());
+        assert_eq!(latest_b.unwrap().id, "snap-repo-b");
+
+        // Querying unknown repo should return None
+        let latest_c = ledger.get_latest_snapshot(Some("/repos/project_c")).unwrap();
+        assert!(latest_c.is_none());
     }
 
     #[test]

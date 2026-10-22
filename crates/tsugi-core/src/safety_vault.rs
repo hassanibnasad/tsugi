@@ -31,6 +31,19 @@ pub struct SafetyVault {
     ledger: Ledger,
 }
 
+/// Normalize a repository path for cross-platform, slash-consistent database recording and querying.
+pub fn normalize_repo_path(path: &Path) -> String {
+    if let Ok(repo) = Repository::discover(path) {
+        if let Some(workdir) = repo.workdir() {
+            let s = workdir.to_string_lossy().replace('\\', "/");
+            return s.trim_end_matches('/').to_string();
+        }
+        let s = repo.path().to_string_lossy().replace('\\', "/");
+        return s.trim_end_matches('/').to_string();
+    }
+    path.to_string_lossy().replace('\\', "/").trim_end_matches('/').to_string()
+}
+
 impl SafetyVault {
     /// Open the safety vault with a ledger at the default path (`~/.tsugi/ledger.sqlite`).
     pub fn open_default() -> Result<Self, TsugiError> {
@@ -58,9 +71,11 @@ impl SafetyVault {
         repo_path: &Path,
         plan: &ResolutionPlan,
     ) -> Result<SnapshotRecord, TsugiError> {
-        let repo = Repository::open(repo_path).map_err(|e| {
+        let repo = Repository::discover(repo_path).map_err(|e| {
             TsugiError::SnapshotFailed(format!("Failed to open repository: {e}"))
         })?;
+        let repo_root = repo.workdir().unwrap_or_else(|| repo.path()).to_path_buf();
+        let norm_path = normalize_repo_path(repo_path);
 
         // 1. Capture HEAD SHA
         let head_sha = repo
@@ -73,14 +88,14 @@ impl SafetyVault {
         debug!("SafetyVault checkpoint: HEAD = {}", head_sha);
 
         // 2. Create stash commit object for working tree without modifying index/refs
-        let stash_sha = create_stash_object(repo_path)?;
+        let stash_sha = create_stash_object(&repo_root)?;
 
-        // 3. Store the stash object under a protective ref so GC does not collect it
+        // 3. Store the stash object and head SHA under protective refs so GC does not collect them
         let timestamp = Utc::now().format("%Y%m%d_%H%M%S").to_string();
         let snapshot_id = uuid::Uuid::new_v4().to_string();
-        let ref_name = format!("refs/tsugi/snapshots/{timestamp}_{id}", id = &snapshot_id[..8]);
 
         if let Some(ref sha) = stash_sha {
+            let ref_name = format!("refs/tsugi/snapshots/{timestamp}_{id}", id = &snapshot_id[..8]);
             let oid = git2::Oid::from_str(sha).map_err(|e| {
                 TsugiError::SnapshotFailed(format!("Invalid stash SHA: {e}"))
             })?;
@@ -88,13 +103,23 @@ impl SafetyVault {
                 .map_err(|e| {
                     TsugiError::SnapshotFailed(format!("Failed to create snapshot ref: {e}"))
                 })?;
-            info!("SafetyVault: pinned ref {} -> {}", ref_name, sha);
+            info!("SafetyVault: pinned stash ref {} -> {}", ref_name, sha);
         }
 
-        // 4. Record snapshot in audit ledger
+        // Pin HEAD ref even on a clean tree so git gc never collects pre-reset commit
+        if head_sha != "unborn" {
+            if let Ok(head_oid) = git2::Oid::from_str(&head_sha) {
+                let head_ref_name = format!("refs/tsugi/snapshots/{timestamp}_{id}_head", id = &snapshot_id[..8]);
+                let _ = repo.reference(&head_ref_name, head_oid, true, "tsugi head snapshot");
+                info!("SafetyVault: pinned head ref {} -> {}", head_ref_name, head_sha);
+            }
+        }
+
+        // 4. Record snapshot in audit ledger with normalized repository path
         let record = SnapshotRecord {
             id: snapshot_id,
             timestamp: Utc::now().to_rfc3339(),
+            repo_path: norm_path,
             head_sha,
             stash_sha,
             plan_summary: plan.root_cause.clone(),
@@ -107,13 +132,18 @@ impl SafetyVault {
         Ok(record)
     }
 
-    /// Roll back the most recent un-reverted snapshot.
+    /// Roll back the most recent un-reverted snapshot for the given repository.
     ///
     /// Returns `Some(SnapshotRecord)` if rolled back, or `None` if no snapshot was pending.
     pub fn rollback_latest(&self, repo_path: &Path) -> Result<Option<SnapshotRecord>, TsugiError> {
-        let latest = self.ledger.get_latest_snapshot()?;
+        let norm_path = normalize_repo_path(repo_path);
+        let latest = self.ledger.get_latest_snapshot(Some(&norm_path))?;
         if let Some(snapshot) = latest {
-            self.rollback_snapshot(repo_path, &snapshot)?;
+            let repo = Repository::discover(repo_path).map_err(|e| {
+                TsugiError::SnapshotFailed(format!("Failed to locate repository: {e}"))
+            })?;
+            let repo_root = repo.workdir().unwrap_or_else(|| repo.path()).to_path_buf();
+            self.rollback_snapshot(&repo_root, &snapshot)?;
             Ok(Some(snapshot))
         } else {
             Ok(None)
@@ -182,8 +212,9 @@ impl SafetyVault {
         success: bool,
         snapshot_id: Option<&str>,
     ) -> Result<(), TsugiError> {
+        let norm_path = normalize_repo_path(Path::new(repo_path));
         self.ledger.record_operation(
-            repo_path,
+            &norm_path,
             user_intent,
             &plan.source.to_string(),
             &plan.risk_tier.to_string(),
@@ -199,12 +230,19 @@ impl SafetyVault {
         repo_path: Option<&str>,
         limit: usize,
     ) -> Result<Vec<OperationRecord>, TsugiError> {
-        self.ledger.recent_operations(repo_path, limit)
+        let norm_path = repo_path.map(|p| normalize_repo_path(Path::new(p)));
+        self.ledger.recent_operations(norm_path.as_deref(), limit)
     }
 
-    /// Retrieve the latest pending snapshot if available.
-    pub fn get_latest_snapshot(&self) -> Result<Option<SnapshotRecord>, TsugiError> {
-        self.ledger.get_latest_snapshot()
+    /// Retrieve the latest pending snapshot if available (optionally filtered by repo).
+    pub fn get_latest_snapshot(&self, repo_path: Option<&str>) -> Result<Option<SnapshotRecord>, TsugiError> {
+        self.ledger.get_latest_snapshot(repo_path)
+    }
+
+    /// Retrieve the latest pending snapshot discovering repo root from Path.
+    pub fn get_latest_snapshot_for_repo(&self, repo_path: &Path) -> Result<Option<SnapshotRecord>, TsugiError> {
+        let norm_path = normalize_repo_path(repo_path);
+        self.ledger.get_latest_snapshot(Some(&norm_path))
     }
 
     /// Prune snapshot refs older than `max_age_days`.
@@ -335,7 +373,7 @@ mod tests {
             .unwrap();
 
         // Verify latest snapshot is found
-        let latest = vault.get_latest_snapshot().unwrap();
+        let latest = vault.get_latest_snapshot(None).unwrap();
         assert!(latest.is_some());
 
         // Roll back latest
@@ -343,8 +381,84 @@ mod tests {
         assert!(restored.is_some());
 
         // Verify snapshot is now marked rolled back
-        let after_rollback = vault.get_latest_snapshot().unwrap();
+        let after_rollback = vault.get_latest_snapshot(None).unwrap();
         assert!(after_rollback.is_none());
+    }
+
+    #[test]
+    fn test_safety_vault_pins_head_ref_on_clean_tree() {
+        let tmp = TempDir::new().unwrap();
+        let repo = Repository::init(tmp.path()).unwrap();
+
+        // Create an initial commit
+        let test_file = tmp.path().join("file.txt");
+        std::fs::write(&test_file, "initial").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("file.txt")).unwrap();
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+        let head_commit = repo.commit(Some("HEAD"), &sig, &sig, "Initial commit", &tree, &[])
+            .unwrap();
+
+        // Working tree is completely clean
+        let db_path = tmp.path().join("vault.sqlite");
+        let vault = SafetyVault::open(&db_path).unwrap();
+        let plan = test_plan();
+        let snapshot = vault.checkpoint(tmp.path(), &plan).unwrap();
+        assert!(snapshot.stash_sha.is_none()); // clean tree
+
+        // Verify head ref was pinned under refs/tsugi/snapshots/*_head
+        let head_refs: Vec<String> = repo.references_glob("refs/tsugi/snapshots/*_head")
+            .unwrap()
+            .flatten()
+            .map(|r| r.name().unwrap().to_string())
+            .collect();
+        assert_eq!(head_refs.len(), 1);
+
+        let pinned_target = repo.find_reference(&head_refs[0]).unwrap().target().unwrap();
+        assert_eq!(pinned_target, head_commit);
+    }
+
+    #[test]
+    fn test_safety_vault_cross_repo_rollback_isolation() {
+        let tmp = TempDir::new().unwrap();
+        let repo_a_path = tmp.path().join("repo_a");
+        let repo_b_path = tmp.path().join("repo_b");
+        std::fs::create_dir_all(&repo_a_path).unwrap();
+        std::fs::create_dir_all(&repo_b_path).unwrap();
+
+        let repo_a = Repository::init(&repo_a_path).unwrap();
+        let _repo_b = Repository::init(&repo_b_path).unwrap();
+
+        // Create commit in repo_a
+        let file_a = repo_a_path.join("a.txt");
+        std::fs::write(&file_a, "initial a").unwrap();
+        let mut idx_a = repo_a.index().unwrap();
+        idx_a.add_path(Path::new("a.txt")).unwrap();
+        idx_a.write().unwrap();
+        let tree_id_a = idx_a.write_tree().unwrap();
+        let tree_a = repo_a.find_tree(tree_id_a).unwrap();
+        let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+        repo_a.commit(Some("HEAD"), &sig, &sig, "A commit", &tree_a, &[]).unwrap();
+
+        let db_path = tmp.path().join("shared_vault.sqlite");
+        let vault = SafetyVault::open(&db_path).unwrap();
+
+        // Checkpoint in repo A
+        let plan = test_plan();
+        let snapshot_a = vault.checkpoint(&repo_a_path, &plan).unwrap();
+        assert_eq!(snapshot_a.repo_path, normalize_repo_path(&repo_a_path));
+
+        // Attempting to rollback repo B should return None (not touch repo A's snapshot)
+        let rollback_b = vault.rollback_latest(&repo_b_path).unwrap();
+        assert!(rollback_b.is_none());
+
+        // Rollback repo A succeeds
+        let rollback_a = vault.rollback_latest(&repo_a_path).unwrap();
+        assert!(rollback_a.is_some());
+        assert_eq!(rollback_a.unwrap().id, snapshot_a.id);
     }
 
     #[test]
