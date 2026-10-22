@@ -38,36 +38,31 @@ pub fn try_resolve(state: &RepoState, user_intent: &str) -> Option<ResolutionPla
     if let Some(ref op) = state.ongoing_operation {
         match op {
             OngoingOperation::Rebase { interactive, .. } => {
-                if !state.conflicts.is_empty() {
-                    return Some(resolve_rebase_conflicts(state, *interactive));
-                }
-                if intent_matches_any(&intent, &["continue", "finish", "resume", "fix"]) {
-                    return Some(resolve_rebase_continue(state, *interactive));
-                }
                 if intent_matches_any(&intent, &["abort", "cancel", "stop", "undo"]) {
                     return Some(resolve_rebase_abort(state));
                 }
-                // If there's an ongoing rebase with no explicit intent, suggest resolution
+                // Never hijack conflict resolution in Tier-0: defer to LLM engine
                 if !state.conflicts.is_empty() {
-                    return Some(resolve_rebase_conflicts(state, *interactive));
+                    return None;
                 }
-                return Some(resolve_rebase_continue(state, *interactive));
+                if intent_matches_any(&intent, &["continue", "finish", "resume", "fix"]) || intent.is_empty() {
+                    return Some(resolve_rebase_continue(state, *interactive));
+                }
+                return None;
             }
 
-            OngoingOperation::Merge { merge_head } => {
-                if !state.conflicts.is_empty() {
-                    return Some(resolve_merge_conflicts(state, merge_head));
-                }
+            OngoingOperation::Merge { .. } => {
                 if intent_matches_any(&intent, &["abort", "cancel", "undo"]) {
                     return Some(resolve_merge_abort(state));
+                }
+                // Never hijack conflict resolution in Tier-0: defer to LLM engine
+                if !state.conflicts.is_empty() {
+                    return None;
                 }
                 return Some(resolve_merge_continue(state));
             }
 
             OngoingOperation::CherryPick { cherry_pick_head } => {
-                if !state.conflicts.is_empty() {
-                    return Some(resolve_cherry_pick_conflicts(state, cherry_pick_head));
-                }
                 if intent_matches_any(&intent, &["abort", "cancel", "undo"]) {
                     return Some(plan(
                         "Cherry-pick in progress — aborting per user request",
@@ -75,6 +70,10 @@ pub fn try_resolve(state: &RepoState, user_intent: &str) -> Option<ResolutionPla
                         vec![step("git cherry-pick --abort", "Abort the cherry-pick operation", false)],
                         "git cherry-pick --abort",
                     ));
+                }
+                // Never hijack conflict resolution in Tier-0: defer to LLM engine
+                if !state.conflicts.is_empty() {
+                    return None;
                 }
                 return Some(plan(
                     &format!("Cherry-pick of {} paused — no conflicts detected, continuing", &cherry_pick_head[..7.min(cherry_pick_head.len())]),
@@ -84,19 +83,7 @@ pub fn try_resolve(state: &RepoState, user_intent: &str) -> Option<ResolutionPla
                 ));
             }
 
-            OngoingOperation::Revert { revert_head } => {
-                if !state.conflicts.is_empty() {
-                    return Some(plan(
-                        &format!("Revert of {} has conflicts — resolve and continue", &revert_head[..7.min(revert_head.len())]),
-                        RiskTier::MutatingSafe,
-                        vec![
-                            step("git checkout --theirs .", "Accept reverted version for all conflicts", true),
-                            step("git add .", "Stage resolved files", false),
-                            step("git revert --continue", "Continue the revert operation", false),
-                        ],
-                        "git revert --abort",
-                    ));
-                }
+            OngoingOperation::Revert { .. } => {
                 if intent_matches_any(&intent, &["abort", "cancel", "undo"]) {
                     return Some(plan(
                         "Revert in progress — aborting per user request",
@@ -105,6 +92,16 @@ pub fn try_resolve(state: &RepoState, user_intent: &str) -> Option<ResolutionPla
                         "git revert --abort",
                     ));
                 }
+                // Never hijack conflict resolution in Tier-0: defer to LLM engine
+                if !state.conflicts.is_empty() {
+                    return None;
+                }
+                return Some(plan(
+                    "Revert in progress — continuing",
+                    RiskTier::MutatingSafe,
+                    vec![step("git revert --continue", "Continue the revert operation", false)],
+                    "git revert --abort",
+                ));
             }
 
             OngoingOperation::Bisect { .. } => {
@@ -290,43 +287,6 @@ pub fn try_resolve(state: &RepoState, user_intent: &str) -> Option<ResolutionPla
 // Specialized Resolution Builders
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn resolve_rebase_conflicts(state: &RepoState, interactive: bool) -> ResolutionPlan {
-    let conflict_files: Vec<String> = state.conflicts.iter().map(|c| c.path.clone()).collect();
-    let conflict_list = conflict_files.join(", ");
-
-    let mut steps = Vec::new();
-
-    // For each conflict, add a checkout step (user should review and pick a strategy)
-    for conflict in &state.conflicts {
-        steps.push(step(
-            &format!("# Resolve conflict in: {}", conflict.path),
-            &format!("Open {} and resolve the conflict markers (<<<<<<< / ======= / >>>>>>>)", conflict.path),
-            true,
-        ));
-    }
-
-    steps.push(step(
-        &format!("git add {}", conflict_files.join(" ")),
-        "Stage the resolved files",
-        false,
-    ));
-
-    steps.push(step(
-        "git rebase --continue",
-        "Continue the rebase with resolved conflicts",
-        false,
-    ));
-
-    let mode = if interactive { "Interactive rebase" } else { "Rebase" };
-
-    plan(
-        &format!("{mode} paused due to conflicts in: {conflict_list}"),
-        RiskTier::MutatingSafe,
-        steps,
-        "git rebase --abort",
-    )
-}
-
 fn resolve_rebase_continue(_state: &RepoState, interactive: bool) -> ResolutionPlan {
     let mode = if interactive { "Interactive rebase" } else { "Rebase" };
 
@@ -347,40 +307,6 @@ fn resolve_rebase_abort(_state: &RepoState) -> ResolutionPlan {
     )
 }
 
-fn resolve_merge_conflicts(state: &RepoState, merge_head: &str) -> ResolutionPlan {
-    let conflict_files: Vec<String> = state.conflicts.iter().map(|c| c.path.clone()).collect();
-    let merge_sha_short = &merge_head[..7.min(merge_head.len())];
-
-    let mut steps = Vec::new();
-
-    for conflict in &state.conflicts {
-        steps.push(step(
-            &format!("# Resolve conflict in: {}", conflict.path),
-            &format!("Open {} and resolve the conflict markers", conflict.path),
-            true,
-        ));
-    }
-
-    steps.push(step(
-        &format!("git add {}", conflict_files.join(" ")),
-        "Stage the resolved files",
-        false,
-    ));
-
-    steps.push(step(
-        "git commit",
-        "Complete the merge commit",
-        false,
-    ));
-
-    plan(
-        &format!("Merge of {merge_sha_short} has conflicts"),
-        RiskTier::MutatingSafe,
-        steps,
-        "git merge --abort",
-    )
-}
-
 fn resolve_merge_continue(_state: &RepoState) -> ResolutionPlan {
     plan(
         "Merge in progress — no conflicts detected, completing merge commit",
@@ -396,40 +322,6 @@ fn resolve_merge_abort(_state: &RepoState) -> ResolutionPlan {
         RiskTier::MutatingSafe,
         vec![step("git merge --abort", "Abort the merge and restore the branch to its pre-merge state", false)],
         "No rollback needed — merge abort itself is the rollback operation",
-    )
-}
-
-fn resolve_cherry_pick_conflicts(state: &RepoState, cherry_pick_head: &str) -> ResolutionPlan {
-    let conflict_files: Vec<String> = state.conflicts.iter().map(|c| c.path.clone()).collect();
-    let sha_short = &cherry_pick_head[..7.min(cherry_pick_head.len())];
-
-    let mut steps = Vec::new();
-
-    for conflict in &state.conflicts {
-        steps.push(step(
-            &format!("# Resolve conflict in: {}", conflict.path),
-            &format!("Open {} and resolve the conflict markers", conflict.path),
-            true,
-        ));
-    }
-
-    steps.push(step(
-        &format!("git add {}", conflict_files.join(" ")),
-        "Stage the resolved files",
-        false,
-    ));
-
-    steps.push(step(
-        "git cherry-pick --continue",
-        "Continue the cherry-pick operation",
-        false,
-    ));
-
-    plan(
-        &format!("Cherry-pick of {sha_short} has conflicts"),
-        RiskTier::MutatingSafe,
-        steps,
-        "git cherry-pick --abort",
     )
 }
 
@@ -574,11 +466,15 @@ mod tests {
             conflict_type: ConflictType::BothModified,
         }];
 
+        // When conflicts are present, Tier-0 must NOT hijack; it defers to the LLM
         let plan = try_resolve(&state, "fix my rebase");
-        assert!(plan.is_some());
-        let plan = plan.unwrap();
-        assert!(plan.root_cause.contains("conflict"));
-        assert!(plan.rollback_cmd.contains("rebase --abort"));
+        assert!(plan.is_none());
+
+        // An explicit abort intent, however, is handled deterministically
+        let abort_plan = try_resolve(&state, "abort rebase");
+        assert!(abort_plan.is_some());
+        let abort_plan = abort_plan.unwrap();
+        assert!(abort_plan.execution_steps[0].cmd.contains("rebase --abort"));
     }
 
     #[test]
