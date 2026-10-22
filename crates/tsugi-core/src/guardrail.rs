@@ -102,8 +102,8 @@ static POLICIES: &[PolicyRule] = &[
 
 /// Check if a space-separated pattern appears as a contiguous token sequence in the command.
 fn matches_command_pattern(cmd: &str, pattern: &str) -> bool {
-    let cmd_tokens: Vec<&str> = cmd.split_whitespace().collect();
-    let pat_tokens: Vec<&str> = pattern.split_whitespace().collect();
+    let cmd_tokens = shlex::split(cmd).unwrap_or_else(|| cmd.split_whitespace().map(|s| s.to_string()).collect());
+    let pat_tokens = shlex::split(pattern).unwrap_or_else(|| pattern.split_whitespace().map(|s| s.to_string()).collect());
     if pat_tokens.is_empty() || cmd_tokens.is_empty() || pat_tokens.len() > cmd_tokens.len() {
         return false;
     }
@@ -130,25 +130,54 @@ pub fn apply_guardrails(
     let mut modified_steps = Vec::with_capacity(plan.execution_steps.len());
 
     for mut step in plan.execution_steps {
+        // Skip comment steps
+        if step.cmd.trim_start().starts_with('#') {
+            modified_steps.push(step);
+            continue;
+        }
+
+        // Validate that the command is a git command using shlex
+        let cmd_tokens = match shlex::split(&step.cmd) {
+            Some(tokens) if !tokens.is_empty() => tokens,
+            Some(_) => {
+                return Err(TsugiError::PolicyViolation(
+                    "Empty command step encountered".to_string(),
+                ));
+            }
+            None => {
+                return Err(TsugiError::PolicyViolation(format!(
+                    "Command '{}' contains invalid quoting or escaping",
+                    step.cmd
+                )));
+            }
+        };
+
+        if cmd_tokens[0] != "git" {
+            return Err(TsugiError::PolicyViolation(format!(
+                "Command '{}' was blocked: only 'git' commands are permitted",
+                step.cmd
+            )));
+        }
+
         // First handle force-push flag rewriting on token level
-        let cmd_tokens: Vec<&str> = step.cmd.split_whitespace().collect();
-        if cmd_tokens.starts_with(&["git", "push"]) {
+        if cmd_tokens.len() >= 2 && cmd_tokens[0] == "git" && cmd_tokens[1] == "push" {
             let mut rewritten = false;
             let new_tokens: Vec<String> = cmd_tokens
                 .iter()
                 .map(|tok| {
-                    if *tok == "--force" || *tok == "-f" {
+                    if tok == "--force" || tok == "-f" {
                         rewritten = true;
                         "--force-with-lease".to_string()
                     } else {
-                        tok.to_string()
+                        tok.clone()
                     }
                 })
                 .collect();
 
             if rewritten {
                 let original = step.cmd.clone();
-                step.cmd = new_tokens.join(" ");
+                step.cmd = shlex::try_join(new_tokens.iter().map(|s| s.as_str()))
+                    .unwrap_or_else(|_| new_tokens.join(" "));
                 info!(
                     "Guardrail: rewrote '{}' → '{}'. Reason: Replaced force push with --force-with-lease to protect shared history",
                     original, step.cmd
@@ -281,5 +310,25 @@ mod tests {
         assert!(!result.execution_steps[0].requires_confirmation);
         assert!(!result.execution_steps[1].requires_confirmation);
         assert!(!result.execution_steps[2].requires_confirmation);
+    }
+
+    #[test]
+    fn test_non_git_command_blocked() {
+        let plan = test_plan(vec![test_step("bash -c 'evil command'")]);
+        let config = TsugiConfig::default();
+        let result = apply_guardrails(plan, &config);
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), TsugiError::PolicyViolation(_)));
+    }
+
+    #[test]
+    fn test_comment_step_allowed() {
+        let plan = test_plan(vec![
+            test_step("# This is a manual instruction"),
+            test_step("git status"),
+        ]);
+        let config = TsugiConfig::default();
+        let result = apply_guardrails(plan, &config);
+        assert!(result.is_ok());
     }
 }

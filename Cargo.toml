@@ -52,6 +52,9 @@ dirs = "6"
 # UUID generation for snapshot IDs
 uuid = { version = "1", features = ["v4"] }
 
+# Shell lexical parsing for safe command execution
+shlex = "1"
+
 [profile.release]
 opt-level = 3
 lto = "fat"

@@ -237,7 +237,11 @@ pub fn execute_plan(
 fn execute_git_command(cmd: &str, repo_path: &Path) -> Result<String, TsugiError> {
     debug!("Executing: {cmd} in {}", repo_path.display());
 
-    let parts: Vec<&str> = cmd.split_whitespace().collect();
+    let parts = shlex::split(cmd).ok_or_else(|| TsugiError::ExecutionFailed {
+        cmd: cmd.to_string(),
+        reason: "Failed to parse command arguments: mismatched quotes or escapes".to_string(),
+    })?;
+
     if parts.is_empty() {
         return Err(TsugiError::ExecutionFailed {
             cmd: cmd.to_string(),
@@ -245,7 +249,14 @@ fn execute_git_command(cmd: &str, repo_path: &Path) -> Result<String, TsugiError
         });
     }
 
-    let output = Command::new(parts[0])
+    if parts[0] != "git" {
+        return Err(TsugiError::ExecutionFailed {
+            cmd: cmd.to_string(),
+            reason: format!("Refusing to execute non-git command: '{}'", parts[0]),
+        });
+    }
+
+    let output = Command::new(&parts[0])
         .args(&parts[1..])
         .current_dir(repo_path)
         .output()
@@ -338,5 +349,64 @@ mod tests {
         let observer = CapturingObserver::new(false);
         let result = execute_plan_with_observer(&plan, tmp.path(), &observer);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_execute_git_command_rejects_non_git() {
+        let tmp = TempDir::new().unwrap();
+        let plan = ResolutionPlan {
+            root_cause: "Malicious plan".to_string(),
+            risk_tier: RiskTier::MutatingDangerous,
+            execution_steps: vec![ExecutionStep {
+                cmd: "rm -rf /".to_string(),
+                explanation: "Delete files".to_string(),
+                requires_confirmation: false,
+            }],
+            rollback_cmd: "none".to_string(),
+            source: PlanSource::Tier0,
+            confidence: 1.0,
+        };
+
+        let observer = CapturingObserver::new(true);
+        let result = execute_plan_with_observer(&plan, tmp.path(), &observer);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("non-git"));
+    }
+
+    #[test]
+    fn test_execute_git_command_handles_quoted_arguments() {
+        let tmp = TempDir::new().unwrap();
+        let repo = git2::Repository::init(tmp.path()).unwrap();
+
+        // Create an initial commit
+        let test_file = tmp.path().join("dummy.txt");
+        std::fs::write(&test_file, "initial").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("dummy.txt")).unwrap();
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "Initial commit", &tree, &[]).unwrap();
+
+        // Modify file to stash
+        std::fs::write(&test_file, "modified content").unwrap();
+
+        let plan = ResolutionPlan {
+            root_cause: "Stash test".to_string(),
+            risk_tier: RiskTier::MutatingSafe,
+            execution_steps: vec![ExecutionStep {
+                cmd: "git stash push -m \"tsugi safety backup message\"".to_string(),
+                explanation: "Stash with spaces in quotes".to_string(),
+                requires_confirmation: false,
+            }],
+            rollback_cmd: "git stash pop".to_string(),
+            source: PlanSource::Tier0,
+            confidence: 1.0,
+        };
+
+        let observer = CapturingObserver::new(true);
+        let executed = execute_plan_with_observer(&plan, tmp.path(), &observer).unwrap();
+        assert_eq!(executed.len(), 1);
     }
 }

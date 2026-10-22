@@ -19,6 +19,7 @@ tracing.workspace = true
 dirs.workspace = true
 uuid.workspace = true
 colored.workspace = true
+shlex.workspace = true
 
 [dev-dependencies]
 tempfile = "3"
