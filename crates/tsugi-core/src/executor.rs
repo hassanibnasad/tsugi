@@ -5,7 +5,7 @@
 
 use std::io::{self, Write};
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 
 use colored::Colorize;
@@ -259,6 +259,10 @@ fn execute_git_command(cmd: &str, repo_path: &Path) -> Result<String, TsugiError
     let output = Command::new(&parts[0])
         .args(&parts[1..])
         .current_dir(repo_path)
+        .stdin(Stdio::null())
+        .env("GIT_EDITOR", "true")
+        .env("GIT_SEQUENCE_EDITOR", "true")
+        .env("GIT_TERMINAL_PROMPT", "0")
         .output()
         .map_err(|e| TsugiError::ExecutionFailed {
             cmd: cmd.to_string(),
@@ -408,5 +412,19 @@ mod tests {
         let observer = CapturingObserver::new(true);
         let executed = execute_plan_with_observer(&plan, tmp.path(), &observer).unwrap();
         assert_eq!(executed.len(), 1);
+    }
+
+    #[test]
+    fn test_editor_and_terminal_prompt_env_vars_prevent_hang() {
+        let tmp = TempDir::new().unwrap();
+        let repo = git2::Repository::init(tmp.path()).unwrap();
+        let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+        let tree_id = repo.index().unwrap().write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "Initial commit", &tree, &[]).unwrap();
+
+        // Executing git commit without message should fail immediately via GIT_EDITOR=true rather than hanging
+        let res = execute_git_command("git commit --allow-empty", tmp.path());
+        assert!(res.is_err(), "git commit without message should fail rather than hang on interactive editor");
     }
 }
