@@ -198,8 +198,10 @@ fn cmd_fix(repo_path: &PathBuf, user_intent: &str, auto_confirm: bool, json_outp
     // Print the plan
     formatter::print_plan(&plan);
 
-    // For dangerous plans, require explicit go-ahead
-    if matches!(plan.risk_tier, RiskTier::MutatingDangerous | RiskTier::HistoryRewrite) && !auto_confirm {
+    // For dangerous plans or plans containing dangerous steps, require explicit go-ahead
+    let requires_plan_confirm = matches!(plan.risk_tier, RiskTier::MutatingDangerous | RiskTier::HistoryRewrite)
+        || plan.execution_steps.iter().any(|s| s.requires_confirmation);
+    if requires_plan_confirm && !auto_confirm {
         println!(
             "\n  {} {}",
             "⚠".yellow(),
