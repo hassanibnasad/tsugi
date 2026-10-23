@@ -130,15 +130,9 @@ impl TsugiEngine {
         // 1. Verify guardrail policy on the plan
         let plan = guardrail::apply_guardrails(plan.clone(), &self.config)?;
 
-        // 2. Create shadow snapshot if plan is mutating
+        // 2. Create shadow snapshot if plan is mutating (fail-closed)
         let snapshot = if self.config.auto_snapshot && plan.risk_tier != RiskTier::ReadOnly {
-            match self.vault.checkpoint(repo_path, &plan) {
-                Ok(snap) => Some(snap),
-                Err(e) => {
-                    tracing::warn!("Safety checkpoint failed (continuing anyway): {e}");
-                    None
-                }
-            }
+            Some(self.vault.checkpoint(repo_path, &plan)?)
         } else {
             None
         };
@@ -185,7 +179,7 @@ impl TsugiEngine {
         match self.plan(&state, user_intent)? {
             PlanOutcome::Ready(plan) => {
                 let snapshot = if self.config.auto_snapshot && plan.risk_tier != RiskTier::ReadOnly {
-                    self.vault.checkpoint(repo_path, &plan).ok()
+                    Some(self.vault.checkpoint(repo_path, &plan)?)
                 } else {
                     None
                 };

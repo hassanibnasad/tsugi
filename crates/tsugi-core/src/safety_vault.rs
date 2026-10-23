@@ -17,7 +17,7 @@
 //!    re-applies dirty working tree state while marking the audit record as rolled back.
 
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use chrono::Utc;
 use git2::Repository;
@@ -88,7 +88,7 @@ impl SafetyVault {
         debug!("SafetyVault checkpoint: HEAD = {}", head_sha);
 
         // 2. Create stash commit object for working tree without modifying index/refs
-        let stash_sha = create_stash_object(&repo_root)?;
+        let stash_sha = create_stash_object(&repo_root, &head_sha)?;
 
         // 3. Store the stash object and head SHA under protective refs so GC does not collect them
         let timestamp = Utc::now().format("%Y%m%d_%H%M%S").to_string();
@@ -289,25 +289,223 @@ impl SafetyVault {
     }
 }
 
-/// Helper to create a stash commit object using `git stash create`.
-fn create_stash_object(repo_path: &Path) -> Result<Option<String>, TsugiError> {
+/// Helper to create a stash commit object using `git stash create` and untracked file capture.
+fn create_stash_object(repo_path: &Path, head_sha: &str) -> Result<Option<String>, TsugiError> {
+    if head_sha == "unborn" {
+        debug!("SafetyVault: unborn repository, no stash possible");
+        return Ok(None);
+    }
+
+    // 1. Run git stash create to capture staged and unstaged tracked changes
     let output = Command::new("git")
         .args(["stash", "create"])
         .current_dir(repo_path)
         .output()
         .map_err(|e| {
-            TsugiError::SnapshotFailed(format!("Failed to create stash object: {e}"))
+            TsugiError::SnapshotFailed(format!("Failed to spawn git stash create: {e}"))
         })?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-
-    if stdout.is_empty() {
-        debug!("SafetyVault: working tree clean, no stash needed");
-        Ok(None)
-    } else {
-        debug!("SafetyVault: created stash object: {stdout}");
-        Ok(Some(stdout))
+    // Fail-closed on error status (e.g. unmerged index entries / active conflicts)
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(TsugiError::SnapshotFailed(format!(
+            "git stash create failed with exit status {}: {}",
+            output.status.code().unwrap_or(-1),
+            if stderr.is_empty() {
+                "unmerged index entries or working tree conflict".to_string()
+            } else {
+                stderr
+            }
+        )));
     }
+
+    let raw_stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let tracked_stash_sha = if !raw_stdout.is_empty()
+        && raw_stdout.len() == 40
+        && raw_stdout.chars().all(|c| c.is_ascii_hexdigit())
+    {
+        Some(raw_stdout)
+    } else {
+        None
+    };
+
+    // 2. Query untracked files
+    let untracked_output = Command::new("git")
+        .args(["ls-files", "--others", "--exclude-standard"])
+        .current_dir(repo_path)
+        .output()
+        .map_err(|e| {
+            TsugiError::SnapshotFailed(format!("Failed to list untracked files: {e}"))
+        })?;
+
+    if !untracked_output.status.success() {
+        let stderr = String::from_utf8_lossy(&untracked_output.stderr).trim().to_string();
+        return Err(TsugiError::SnapshotFailed(format!(
+            "git ls-files failed: {stderr}"
+        )));
+    }
+
+    let untracked_files: Vec<String> = String::from_utf8_lossy(&untracked_output.stdout)
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+
+    // If there are no untracked files, return the tracked stash object (or None if working tree clean)
+    if untracked_files.is_empty() {
+        if let Some(ref sha) = tracked_stash_sha {
+            debug!("SafetyVault: created stash object for tracked changes: {sha}");
+            return Ok(Some(sha.clone()));
+        } else {
+            debug!("SafetyVault: working tree clean, no stash needed");
+            return Ok(None);
+        }
+    }
+
+    // 3. Untracked files exist: capture them in an isolated temporary index without touching repo state
+    let repo = Repository::discover(repo_path).map_err(|e| {
+        TsugiError::SnapshotFailed(format!("Failed to discover repository for untracked snapshot: {e}"))
+    })?;
+    let git_dir = repo.path();
+    let tmp_index_path = git_dir.join(format!("tsugi_untracked_{}.idx", uuid::Uuid::new_v4().simple()));
+
+    let mut update_cmd = Command::new("git");
+    update_cmd
+        .arg("update-index")
+        .arg("--add")
+        .arg("--stdin")
+        .env("GIT_INDEX_FILE", &tmp_index_path)
+        .current_dir(repo_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = update_cmd.spawn().map_err(|e| {
+        let _ = std::fs::remove_file(&tmp_index_path);
+        TsugiError::SnapshotFailed(format!("Failed to spawn git update-index for untracked files: {e}"))
+    })?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        use std::io::Write;
+        for file in &untracked_files {
+            let _ = writeln!(stdin, "{}", file);
+        }
+    }
+
+    let update_res = child.wait_with_output().map_err(|e| {
+        let _ = std::fs::remove_file(&tmp_index_path);
+        TsugiError::SnapshotFailed(format!("Failed to wait for git update-index: {e}"))
+    })?;
+
+    if !update_res.status.success() {
+        let _ = std::fs::remove_file(&tmp_index_path);
+        let stderr = String::from_utf8_lossy(&update_res.stderr);
+        return Err(TsugiError::SnapshotFailed(format!(
+            "Failed to index untracked files: {stderr}"
+        )));
+    }
+
+    // Write tree for untracked files
+    let write_tree_output = Command::new("git")
+        .arg("write-tree")
+        .env("GIT_INDEX_FILE", &tmp_index_path)
+        .current_dir(repo_path)
+        .output()
+        .map_err(|e| {
+            let _ = std::fs::remove_file(&tmp_index_path);
+            TsugiError::SnapshotFailed(format!("Failed to write tree for untracked files: {e}"))
+        })?;
+
+    let _ = std::fs::remove_file(&tmp_index_path);
+
+    if !write_tree_output.status.success() {
+        let stderr = String::from_utf8_lossy(&write_tree_output.stderr);
+        return Err(TsugiError::SnapshotFailed(format!(
+            "git write-tree for untracked files failed: {stderr}"
+        )));
+    }
+
+    let u_tree = String::from_utf8_lossy(&write_tree_output.stdout).trim().to_string();
+
+    // Commit tree for untracked files
+    let u_commit_output = Command::new("git")
+        .args(["commit-tree", "-m", "untracked files on tsugi snapshot", &u_tree])
+        .current_dir(repo_path)
+        .output()
+        .map_err(|e| {
+            TsugiError::SnapshotFailed(format!("Failed to commit tree for untracked files: {e}"))
+        })?;
+
+    if !u_commit_output.status.success() {
+        let stderr = String::from_utf8_lossy(&u_commit_output.stderr);
+        return Err(TsugiError::SnapshotFailed(format!(
+            "git commit-tree for untracked files failed: {stderr}"
+        )));
+    }
+
+    let u_commit = String::from_utf8_lossy(&u_commit_output.stdout).trim().to_string();
+
+    // 4. Assemble standard 3-parent stash commit object:
+    // Parent 1: HEAD
+    // Parent 2: Index commit
+    // Parent 3: Untracked commit
+    let (tree_sha, p1, p2) = if let Some(ref t_sha) = tracked_stash_sha {
+        let tree = rev_parse(repo_path, &format!("{t_sha}^{{tree}}"))?;
+        let p1 = rev_parse(repo_path, &format!("{t_sha}^1"))?;
+        let p2 = rev_parse(repo_path, &format!("{t_sha}^2"))?;
+        (tree, p1, p2)
+    } else {
+        let head_commit = rev_parse(repo_path, "HEAD")?;
+        let head_tree = rev_parse(repo_path, "HEAD^{tree}")?;
+        let i_commit_output = Command::new("git")
+            .args(["commit-tree", "-m", "index on tsugi snapshot", "-p", &head_commit, &head_tree])
+            .current_dir(repo_path)
+            .output()
+            .map_err(|e| TsugiError::SnapshotFailed(format!("Failed to create index commit: {e}")))?;
+        let i_commit = String::from_utf8_lossy(&i_commit_output.stdout).trim().to_string();
+        (head_tree, head_commit, i_commit)
+    };
+
+    let stash_commit_output = Command::new("git")
+        .args([
+            "commit-tree",
+            "-m",
+            "WIP on tsugi snapshot (with untracked files)",
+            "-p",
+            &p1,
+            "-p",
+            &p2,
+            "-p",
+            &u_commit,
+            &tree_sha,
+        ])
+        .current_dir(repo_path)
+        .output()
+        .map_err(|e| TsugiError::SnapshotFailed(format!("Failed to create 3-parent stash commit: {e}")))?;
+
+    if !stash_commit_output.status.success() {
+        let stderr = String::from_utf8_lossy(&stash_commit_output.stderr);
+        return Err(TsugiError::SnapshotFailed(format!(
+            "git commit-tree for stash failed: {stderr}"
+        )));
+    }
+
+    let final_stash_sha = String::from_utf8_lossy(&stash_commit_output.stdout).trim().to_string();
+    debug!("SafetyVault: created 3-parent stash object with untracked files: {final_stash_sha}");
+    Ok(Some(final_stash_sha))
+}
+
+fn rev_parse(repo_path: &Path, rev: &str) -> Result<String, TsugiError> {
+    let output = Command::new("git")
+        .args(["rev-parse", rev])
+        .current_dir(repo_path)
+        .output()
+        .map_err(|e| TsugiError::SnapshotFailed(format!("Failed to rev-parse {rev}: {e}")))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(TsugiError::SnapshotFailed(format!("git rev-parse {rev} failed: {stderr}")));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 #[cfg(test)]
@@ -403,7 +601,8 @@ mod tests {
             .unwrap();
 
         // Working tree is completely clean
-        let db_path = tmp.path().join("vault.sqlite");
+        let db_tmp = TempDir::new().unwrap();
+        let db_path = db_tmp.path().join("vault.sqlite");
         let vault = SafetyVault::open(&db_path).unwrap();
         let plan = test_plan();
         let snapshot = vault.checkpoint(tmp.path(), &plan).unwrap();
@@ -483,5 +682,104 @@ mod tests {
         assert_eq!(ops.len(), 1);
         assert_eq!(ops[0].user_intent, "fix merge");
         assert!(ops[0].success);
+    }
+
+    #[test]
+    fn test_safety_vault_captures_untracked_files_and_restores() {
+        let tmp = TempDir::new().unwrap();
+        let repo = Repository::init(tmp.path()).unwrap();
+
+        // Initial commit so we have a HEAD
+        let test_file = tmp.path().join("tracked.txt");
+        std::fs::write(&test_file, "initial").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("tracked.txt")).unwrap();
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "Initial commit", &tree, &[]).unwrap();
+
+        // Create an untracked file
+        let untracked_file = tmp.path().join("untracked.txt");
+        std::fs::write(&untracked_file, "untracked secret data").unwrap();
+
+        let db_path = tmp.path().join("vault.sqlite");
+        let vault = SafetyVault::open(&db_path).unwrap();
+        let plan = test_plan();
+
+        // Checkpoint captures untracked files into 3-parent stash commit
+        let snapshot = vault.checkpoint(tmp.path(), &plan).unwrap();
+        assert!(snapshot.stash_sha.is_some());
+
+        // Simulate destructive operation: delete the untracked file and modify tracked file
+        std::fs::remove_file(&untracked_file).unwrap();
+        std::fs::write(&test_file, "corrupted tracked data").unwrap();
+        assert!(!untracked_file.exists());
+
+        // Roll back
+        let rolled_back = vault.rollback_latest(tmp.path()).unwrap();
+        assert!(rolled_back.is_some());
+
+        // Verify untracked file was restored
+        assert!(untracked_file.exists());
+        let content = std::fs::read_to_string(&untracked_file).unwrap();
+        assert_eq!(content, "untracked secret data");
+    }
+
+    #[test]
+    fn test_safety_vault_fails_closed_on_unmerged_index_entries() {
+        let tmp = TempDir::new().unwrap();
+        let repo = Repository::init(tmp.path()).unwrap();
+        let file_path = tmp.path().join("conflict.txt");
+        std::fs::write(&file_path, "base\n").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("conflict.txt")).unwrap();
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+        let base_commit = repo.commit(Some("HEAD"), &sig, &sig, "Base commit", &tree, &[]).unwrap();
+
+        // Create branch b1
+        let base_obj = repo.find_object(base_commit, None).unwrap();
+        let _ = repo.branch("b1", base_obj.as_commit().unwrap(), false).unwrap();
+
+        // Commit on master
+        std::fs::write(&file_path, "master change\n").unwrap();
+        index.add_path(Path::new("conflict.txt")).unwrap();
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let master_parent = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "Master change", &tree, &[&master_parent]).unwrap();
+
+        // Switch to b1 and commit conflicting change
+        repo.set_head("refs/heads/b1").unwrap();
+        repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force())).unwrap();
+        std::fs::write(&file_path, "branch change\n").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("conflict.txt")).unwrap();
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let b1_parent = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "B1 change", &tree, &[&b1_parent]).unwrap();
+
+        // Switch back to master
+        repo.set_head("refs/heads/master").unwrap();
+        repo.checkout_head(Some(git2::build::CheckoutBuilder::new().force())).unwrap();
+
+        // Merge b1 into master to create conflict
+        let b1_annotated = repo.find_annotated_commit(repo.resolve_reference_from_short_name("b1").unwrap().target().unwrap()).unwrap();
+        repo.merge(&[&b1_annotated], None, None).unwrap();
+        assert!(repo.index().unwrap().has_conflicts());
+
+        // Checkpoint must fail-closed because index has unmerged entries
+        let db_path = tmp.path().join("vault.sqlite");
+        let vault = SafetyVault::open(&db_path).unwrap();
+        let plan = test_plan();
+        let res = vault.checkpoint(tmp.path(), &plan);
+        assert!(res.is_err(), "Checkpoint should fail-closed on unmerged conflict state");
     }
 }
