@@ -270,7 +270,7 @@ USER_INTENT: {user_intent}
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Find the `llama-cli` binary on the system PATH or in common install locations.
-fn find_llama_cli() -> Result<PathBuf, TsugiError> {
+pub fn find_llama_cli() -> Result<PathBuf, TsugiError> {
     // Check PATH first
     if let Ok(output) = Command::new("llama-cli").arg("--version").output() {
         if output.status.success() {
@@ -279,17 +279,41 @@ fn find_llama_cli() -> Result<PathBuf, TsugiError> {
     }
 
     // Check common install locations
-    let candidates = [
+    let mut candidates = vec![
+        dirs::home_dir().map(|h| h.join(".tsugi").join("bin").join("llama-cli.exe")),
+        dirs::home_dir().map(|h| h.join(".tsugi").join("llama-cli.exe")),
+        dirs::home_dir().map(|h| h.join(".tsugi").join("bin").join("llama-cli")),
         dirs::home_dir().map(|h| h.join(".local").join("bin").join("llama-cli")),
         dirs::home_dir().map(|h| h.join("llama.cpp").join("build").join("bin").join("llama-cli")),
         Some(PathBuf::from("/usr/local/bin/llama-cli")),
         // Windows paths
         dirs::home_dir().map(|h| h.join("llama.cpp").join("build").join("bin").join("Release").join("llama-cli.exe")),
+        dirs::data_local_dir().map(|d| d.join("Microsoft").join("WinGet").join("Links").join("llama-cli.exe")),
+        dirs::data_local_dir().map(|d| d.join("Programs").join("llama.cpp").join("llama-cli.exe")),
+        Some(PathBuf::from("C:\\Program Files\\llama.cpp\\llama-cli.exe")),
     ];
 
-    for candidate in candidates.iter().flatten() {
+    // Check WinGet Packages directory on Windows
+    if let Some(local_app_data) = dirs::data_local_dir() {
+        let winget_packages = local_app_data.join("Microsoft").join("WinGet").join("Packages");
+        if winget_packages.exists() {
+            if let Ok(entries) = std::fs::read_dir(&winget_packages) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() && path.file_name().map(|n| n.to_string_lossy().contains("llamacpp")).unwrap_or(false) {
+                        let direct_exe = path.join("llama-cli.exe");
+                        if direct_exe.exists() {
+                            candidates.push(Some(direct_exe));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    for candidate in candidates.into_iter().flatten() {
         if candidate.exists() {
-            return Ok(candidate.clone());
+            return Ok(candidate);
         }
     }
 

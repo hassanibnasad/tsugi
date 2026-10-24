@@ -98,11 +98,7 @@ pub fn check_setup() -> SetupStatus {
         .map(|p| p.exists())
         .unwrap_or(false);
 
-    let has_llama_cli = std::process::Command::new("llama-cli")
-        .arg("--version")
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false);
+    let has_llama_cli = crate::engine::find_llama_cli().is_ok();
 
     let has_any_model = has_primary || has_fallback;
 
