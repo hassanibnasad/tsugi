@@ -14,8 +14,8 @@ Features:
     * Strict schema keys reward (root_cause, risk_tier, execution_steps, rollback_cmd)
     * GBNF risk tier enum adherence reward
     * Git command prefix enforcement reward (no arbitrary binary execution)
-    * Push safety reward (--force-with-lease vs --force)
-- Automatic export to GGUF (Q4_K_M and Q5_K_M) saved directly to Google Drive
+    * State-contextual alignment reward (dirty tree data loss, conflict grounding, op state machine)
+- Automatic export to GGUF (Q4_K_M) via local SSD scratch disk persisted to Google Drive
 """
 
 import argparse
@@ -24,8 +24,17 @@ import os
 import re
 import shutil
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+# Ensure UTF-8 output encoding across Windows/Linux/Colab
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Environment & Google Drive Helpers
@@ -47,7 +56,7 @@ def setup_google_drive(mount_point: str = "/content/drive") -> Optional[Path]:
             print("[*] Google Colab detected. Mounting Google Drive...")
             from google.colab import drive  # type: ignore
             drive.mount(mount_point)
-            print("[✔] Google Drive successfully mounted at /content/drive")
+            print("[+] Google Drive successfully mounted at /content/drive")
         except Exception as e:
             print(f"[!] Warning: Failed to mount Google Drive: {e}")
             print("    Checkpoints will be stored in Colab local ephemeral storage.")
@@ -178,24 +187,200 @@ def reward_git_command_safety(completions, **kwargs) -> List[float]:
                 if cmd_str.startswith("#"):
                     continue
 
-                # Every command must start with 'git'
-                tokens = cmd_str.split()
-                if not tokens or tokens[0] != "git":
-                    score -= 2.0  # heavy penalty for non-git command
-                    continue
+                # Support chained commands with &&
+                subcmds = [s.strip() for s in cmd_str.split("&&")]
+                for subcmd in subcmds:
+                    tokens = subcmd.split()
+                    # Every command must start with 'git'
+                    if not tokens or tokens[0] != "git":
+                        score -= 2.0  # heavy penalty for non-git command
+                        continue
 
-                # Must not use raw force push
-                if "push" in tokens and ("--force" in tokens or "-f" in tokens):
-                    if "--force-with-lease" not in tokens:
-                        score -= 2.0
+                    # Must not use raw force push (distinguish from `git stash push`)
+                    if len(tokens) >= 2 and tokens[1] == "push":
+                        if ("--force" in tokens or "-f" in tokens) and "--force-with-lease" not in tokens:
+                            score -= 2.0
 
-                # Must not use reckless reset hard without reference target
-                if tokens[:3] == ["git", "reset", "--hard"] and len(tokens) == 3:
-                    score -= 1.0
+                    # Must not use reckless reset hard without reference target
+                    if tokens[:3] == ["git", "reset", "--hard"] and len(tokens) == 3:
+                        score -= 1.0
 
             rewards.append(score)
         except Exception:
             rewards.append(-1.0)
+    return rewards
+
+
+def extract_prompt_text(prompt) -> str:
+    """Extract plain text from a prompt representation (str, list of dicts, or other)."""
+    if isinstance(prompt, str):
+        return prompt
+    if isinstance(prompt, list):
+        return "\n".join(m.get("content", "") for m in prompt if isinstance(m, dict))
+    return str(prompt)
+
+
+def reward_state_context_alignment(prompts, completions, **kwargs) -> List[float]:
+    """Reward alignment between input [REPO_STATE] and generated JSON execution steps.
+
+    Sub-evaluations:
+    1. Dirty-Tree Data Loss Check (+1.0 / -2.0):
+       If prompt has non-zero unstaged or staged changes (UNSTAGED: ~N or STAGED: +N)
+       and the plan executes destructive commands (`git reset --hard`, `git clean`,
+       `git pull --rebase`, `git checkout -- .`) without a preceding `git stash`,
+       penalize -2.0 (otherwise +1.0).
+    2. Conflict Path Grounding (+1.0 / -1.0):
+       If prompt lists specific conflicted files (CONFLICTS: ["path" ...]),
+       reward +1.0 if the model's commands reference those exact file paths
+       and penalize -1.0 if it hallucinates unrelated file paths.
+    3. Operation State Match (+1.0 / -1.5):
+       If ONGOING_OP is REBASE or INTERACTIVE_REBASE, penalize -1.5 if the plan
+       uses `git merge` or `git cherry-pick` commands (and vice versa for MERGE and CHERRY-PICK).
+       Reward +1.0 for matching the active state machine.
+    """
+    rewards = []
+    for prompt, completion in zip(prompts, completions):
+        prompt_text = extract_prompt_text(prompt)
+        content = completion if isinstance(completion, str) else completion[0]["content"]
+        json_str = extract_json_candidate(content)
+        if not json_str:
+            rewards.append(-1.5)
+            continue
+
+        try:
+            data = json.loads(json_str)
+            if not isinstance(data, dict):
+                rewards.append(-1.5)
+                continue
+
+            steps = data.get("execution_steps", [])
+            rollback = data.get("rollback_cmd", "")
+            cmds = [s.get("cmd", "") for s in steps if isinstance(s, dict)]
+            if rollback:
+                cmds.append(rollback)
+
+            if not cmds:
+                rewards.append(-1.0)
+                continue
+
+            score = 0.0
+
+            # -----------------------------------------------------------------
+            # 1. Dirty-Tree Data Loss Check (+1.0 / -2.0)
+            # -----------------------------------------------------------------
+            has_dirty_tree = False
+            # Check STAGED line for any count > 0: +N, ~N, -N, RN
+            staged_match = re.search(r"STAGED:\s*([^\n|]+)", prompt_text)
+            if staged_match:
+                staged_nums = re.findall(r"[+\-~R](\d+)", staged_match.group(1))
+                if any(int(n) > 0 for n in staged_nums):
+                    has_dirty_tree = True
+
+            # Check UNSTAGED line for any count > 0: ~N, -N
+            unstaged_match = re.search(r"UNSTAGED:\s*([^\n|]+)", prompt_text)
+            if unstaged_match:
+                unstaged_nums = re.findall(r"[+\-~R](\d+)", unstaged_match.group(1))
+                if any(int(n) > 0 for n in unstaged_nums):
+                    has_dirty_tree = True
+
+            destructive_without_stash = False
+            has_stash_before = False
+
+            for cmd in cmds:
+                cmd_clean = cmd.strip()
+                tokens = cmd_clean.split()
+                if len(tokens) >= 2 and tokens[0] == "git" and tokens[1] == "stash":
+                    has_stash_before = True
+
+                is_destructive = False
+                # git reset --hard
+                if "reset" in tokens and "--hard" in tokens:
+                    is_destructive = True
+                # git clean
+                elif "clean" in tokens:
+                    is_destructive = True
+                # git pull --rebase
+                elif "pull" in tokens and any(t.startswith("--rebase") for t in tokens):
+                    is_destructive = True
+                # git checkout -- . or git restore .
+                elif ("checkout" in tokens or "restore" in tokens) and ("." in tokens or "--" in tokens):
+                    is_destructive = True
+
+                if is_destructive and has_dirty_tree and not has_stash_before:
+                    destructive_without_stash = True
+                    break
+
+            if has_dirty_tree:
+                if destructive_without_stash:
+                    score -= 2.0
+                else:
+                    score += 1.0
+            else:
+                score += 0.5  # Neutral-positive baseline for clean working tree
+
+            # -----------------------------------------------------------------
+            # 2. Conflict Path Grounding (+1.0 / -1.0)
+            # -----------------------------------------------------------------
+            conflicts_match = re.search(r"CONFLICTS:\s*\[(.*?)\]", prompt_text)
+            if conflicts_match and "CONFLICTS: NONE" not in prompt_text:
+                conflicted_raw = conflicts_match.group(1)
+                conflicted_files = re.findall(r'"([^"]+)"', conflicted_raw)
+                if conflicted_files:
+                    cmds_text = " ".join(cmds)
+                    references_ground_truth = any(f in cmds_text for f in conflicted_files)
+
+                    cmd_tokens = [t.strip(",;'\"") for t in cmds_text.split()]
+                    file_pattern = re.compile(
+                        r"^[\w\-./\\]+\.(rs|ts|tsx|py|go|js|jsx|json|yml|yaml|md|txt|toml|rb|ex|css|html|sh|sql)$",
+                        re.IGNORECASE,
+                    )
+                    cmd_files = {t for t in cmd_tokens if file_pattern.match(t)}
+
+                    hallucinated = False
+                    for cf in cmd_files:
+                        if cf not in conflicted_files and cf not in prompt_text:
+                            hallucinated = True
+                            break
+
+                    if references_ground_truth and not hallucinated:
+                        score += 1.0
+                    elif hallucinated:
+                        score -= 1.0
+
+            # -----------------------------------------------------------------
+            # 3. Operation State Match (+1.0 / -1.5)
+            # -----------------------------------------------------------------
+            ongoing_match = re.search(r"ONGOING_OP:\s*([^\n]+)", prompt_text)
+            ongoing_str = ongoing_match.group(1).upper() if ongoing_match else "NONE"
+
+            is_rebase = "REBASE" in ongoing_str
+            is_merge = "MERGE" in ongoing_str
+            is_cherry_pick = "CHERRY-PICK" in ongoing_str or "CHERRY_PICK" in ongoing_str
+
+            uses_rebase = any("rebase" in cmd.lower().split() for cmd in cmds)
+            uses_merge = any("merge" in cmd.lower().split() for cmd in cmds)
+            uses_cherry_pick = any("cherry-pick" in cmd.lower().split() for cmd in cmds)
+
+            if is_rebase:
+                if uses_merge or uses_cherry_pick:
+                    score -= 1.5
+                elif uses_rebase:
+                    score += 1.0
+            elif is_merge:
+                if uses_rebase or uses_cherry_pick:
+                    score -= 1.5
+                elif uses_merge:
+                    score += 1.0
+            elif is_cherry_pick:
+                if uses_rebase or uses_merge:
+                    score -= 1.5
+                elif uses_cherry_pick:
+                    score += 1.0
+
+            rewards.append(score)
+        except Exception:
+            rewards.append(-1.0)
+
     return rewards
 
 
@@ -250,7 +435,7 @@ def train_sft(model, tokenizer, dataset, output_dir: Path, max_steps: int = 150)
     )
 
     trainer.train()
-    print("[✔] Stage 1 (SFT) training complete!")
+    print("[+] Stage 1 (SFT) training complete!")
     return trainer
 
 
@@ -310,13 +495,14 @@ def train_grpo(model, tokenizer, dataset, output_dir: Path, max_steps: int = 60)
             reward_schema_conformance,
             reward_risk_tier_enum,
             reward_git_command_safety,
+            reward_state_context_alignment,
         ],
         args=training_args,
         train_dataset=grpo_dataset,
     )
 
     trainer.train()
-    print("[✔] Stage 2 (GRPO) training complete!")
+    print("[+] Stage 2 (GRPO) training complete!")
     return trainer
 
 
@@ -443,26 +629,51 @@ def main():
 
         gguf_output_name = "qwen2.5-coder-1.5b-instruct-q4_k_m"
 
-        # Export locally / to Google Drive
-        target_export_path = models_dir / gguf_output_name
-        print(f"[*] Saving GGUF model directly to: {target_export_path}...")
+        # Export to fast local scratch disk first to avoid Google Drive FUSE I/O bottleneck & quota errors
+        if Path("/content").exists():
+            local_scratch_dir = Path("/content/tsugi_gguf_export")
+        else:
+            local_scratch_dir = Path(tempfile.gettempdir()) / "tsugi_gguf_export"
+
+        local_scratch_dir.mkdir(parents=True, exist_ok=True)
+        local_export_path = local_scratch_dir / gguf_output_name
+
+        print(f"[*] Exporting intermediate FP16 & quantized GGUF to local scratch disk: {local_export_path}...")
+        print("    (Prevents 6.2 GB temporary FP16 safetensors/GGUF from choking Google Drive FUSE mount)")
+
         model.save_pretrained_gguf(
-            str(target_export_path),
+            str(local_export_path),
             tokenizer,
             quantization_method="q4_k_m",
         )
 
-        # Also copy to local ~/.tsugi/models if different
-        local_user_models = Path.home() / ".tsugi" / "models"
-        if local_user_models.resolve() != models_dir.resolve():
-            local_user_models.mkdir(parents=True, exist_ok=True)
-            for f in models_dir.glob(f"{gguf_output_name}*.gguf"):
-                dest = local_user_models / f.name
-                if not dest.exists():
-                    shutil.copy2(f, dest)
-                    print(f"[✔] Copied GGUF to local engine path: {dest}")
+        # Locate produced final .gguf file(s) in scratch disk
+        produced_gguf_files = list(local_scratch_dir.glob(f"{gguf_output_name}*.gguf"))
+        if not produced_gguf_files:
+            produced_gguf_files = list(local_scratch_dir.glob("*.gguf"))
 
-        print(f"\n[✔] Training & GGUF export complete! Models saved in: {models_dir}")
+        if not produced_gguf_files:
+            print(f"[!] Warning: No .gguf files found in {local_scratch_dir}")
+        else:
+            models_dir.mkdir(parents=True, exist_ok=True)
+            for gguf_file in produced_gguf_files:
+                dest = models_dir / gguf_file.name
+                file_mb = gguf_file.stat().st_size / (1024 * 1024)
+                print(f"[*] Copying final quantized GGUF ({file_mb:.1f} MB) to persistent storage: {dest}...")
+                shutil.copy2(gguf_file, dest)
+                print(f"[+] Persisted {dest.name} -> {models_dir}")
+
+            # Also copy to local ~/.tsugi/models if different from models_dir
+            local_user_models = Path.home() / ".tsugi" / "models"
+            if local_user_models.resolve() != models_dir.resolve():
+                local_user_models.mkdir(parents=True, exist_ok=True)
+                for gguf_file in produced_gguf_files:
+                    dest = local_user_models / gguf_file.name
+                    if not dest.exists():
+                        shutil.copy2(gguf_file, dest)
+                        print(f"[+] Copied GGUF to local engine path: {dest}")
+
+        print(f"\n[+] Training & GGUF export complete! Models saved in: {models_dir}")
         print("    Ready to test with: tsugi fix")
 
 
