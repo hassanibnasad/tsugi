@@ -51,7 +51,7 @@ def setup_google_drive(mount_point: str = "/content/drive") -> Optional[Path]:
         return None
 
     drive_path = Path(mount_point)
-    if not drive_path.exists():
+    if not (drive_path / "MyDrive").exists():
         try:
             print("[*] Google Colab detected. Mounting Google Drive...")
             from google.colab import drive  # type: ignore
@@ -60,11 +60,26 @@ def setup_google_drive(mount_point: str = "/content/drive") -> Optional[Path]:
         except Exception as e:
             print(f"[!] Warning: Failed to mount Google Drive: {e}")
             print("    Checkpoints will be stored in Colab local ephemeral storage.")
+            print("    Tip: Run `from google.colab import drive; drive.mount('/content/drive')` in a Colab notebook cell before running this script.")
             return None
 
     tsugi_drive_dir = drive_path / "MyDrive" / "tsugi"
     tsugi_drive_dir.mkdir(parents=True, exist_ok=True)
     return tsugi_drive_dir
+
+
+def is_bf16_supported() -> bool:
+    """Check if bfloat16 is supported on the current hardware/environment."""
+    try:
+        from unsloth import is_bfloat16_supported
+        return is_bfloat16_supported()
+    except (ImportError, AttributeError):
+        pass
+    try:
+        import torch
+        return torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+    except Exception:
+        return False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -408,32 +423,49 @@ def train_sft(model, tokenizer, dataset, output_dir: Path, max_steps: int = 150)
 
     formatted_dataset = dataset.map(formatting_prompts_func, batched=True)
 
-    trainer = SFTTrainer(
-        model=model,
-        tokenizer=tokenizer,
-        train_dataset=formatted_dataset,
-        dataset_text_field="text",
-        max_seq_length=2048,
-        dataset_num_proc=2,
-        packing=False,
-        args=TrainingArguments(
-            per_device_train_batch_size=2,
-            gradient_accumulation_steps=4,
-            warmup_steps=10,
-            max_steps=max_steps,
-            learning_rate=2e-4,
-            fp16=not FastLanguageModel.is_bfloat16_supported(),
-            bf16=FastLanguageModel.is_bfloat16_supported(),
-            logging_steps=10,
-            optim="adamw_8bit",
-            weight_decay=0.01,
-            lr_scheduler_type="cosine",
-            seed=3407,
-            output_dir=str(output_dir),
-            report_to="none",
-        ),
+    bf16_available = is_bf16_supported()
+
+    trainer_args = TrainingArguments(
+        per_device_train_batch_size=2,
+        gradient_accumulation_steps=4,
+        warmup_steps=10,
+        max_steps=max_steps,
+        learning_rate=2e-4,
+        fp16=not bf16_available,
+        bf16=bf16_available,
+        logging_steps=10,
+        optim="adamw_8bit",
+        weight_decay=0.01,
+        lr_scheduler_type="cosine",
+        seed=3407,
+        output_dir=str(output_dir),
+        report_to="none",
     )
 
+    try:
+        trainer = SFTTrainer(
+            model=model,
+            processing_class=tokenizer,
+            train_dataset=formatted_dataset,
+            dataset_text_field="text",
+            max_seq_length=2048,
+            dataset_num_proc=2,
+            packing=False,
+            args=trainer_args,
+        )
+    except TypeError:
+        trainer = SFTTrainer(
+            model=model,
+            tokenizer=tokenizer,
+            train_dataset=formatted_dataset,
+            dataset_text_field="text",
+            max_seq_length=2048,
+            dataset_num_proc=2,
+            packing=False,
+            args=trainer_args,
+        )
+
+    FastLanguageModel.for_training(model)
     trainer.train()
     print("[+] Stage 1 (SFT) training complete!")
     return trainer
@@ -468,6 +500,8 @@ def train_grpo(model, tokenizer, dataset, output_dir: Path, max_steps: int = 60)
 
     grpo_dataset = dataset.map(grpo_formatting_func, batched=True)
 
+    bf16_available = is_bf16_supported()
+
     training_args = GRPOConfig(
         learning_rate=5e-6,
         adam_beta1=0.9,
@@ -476,8 +510,8 @@ def train_grpo(model, tokenizer, dataset, output_dir: Path, max_steps: int = 60)
         warmup_ratio=0.1,
         lr_scheduler_type="cosine",
         logging_steps=5,
-        bf16=FastLanguageModel.is_bfloat16_supported(),
-        fp16=not FastLanguageModel.is_bfloat16_supported(),
+        bf16=bf16_available,
+        fp16=not bf16_available,
         per_device_train_batch_size=1,
         gradient_accumulation_steps=4,
         num_generations=4,  # Group size for relative evaluation
@@ -488,19 +522,25 @@ def train_grpo(model, tokenizer, dataset, output_dir: Path, max_steps: int = 60)
         report_to="none",
     )
 
-    trainer = GRPOTrainer(
-        model=model,
-        reward_funcs=[
+    trainer_kwargs = {
+        "model": model,
+        "reward_funcs": [
             reward_valid_json,
             reward_schema_conformance,
             reward_risk_tier_enum,
             reward_git_command_safety,
             reward_state_context_alignment,
         ],
-        args=training_args,
-        train_dataset=grpo_dataset,
-    )
+        "args": training_args,
+        "train_dataset": grpo_dataset,
+    }
 
+    try:
+        trainer = GRPOTrainer(processing_class=tokenizer, **trainer_kwargs)
+    except TypeError:
+        trainer = GRPOTrainer(tokenizer=tokenizer, **trainer_kwargs)
+
+    FastLanguageModel.for_training(model)
     trainer.train()
     print("[+] Stage 2 (GRPO) training complete!")
     return trainer
@@ -626,6 +666,8 @@ def main():
         print(f"\n{'='*60}")
         print("[*] Exporting model to GGUF format (Q4_K_M)...")
         print(f"{'='*60}\n")
+
+        FastLanguageModel.for_inference(model)
 
         gguf_output_name = "qwen2.5-coder-1.5b-instruct-q4_k_m"
 
