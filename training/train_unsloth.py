@@ -689,31 +689,34 @@ def main():
             quantization_method="q4_k_m",
         )
 
-        # Locate produced final .gguf file(s) in scratch disk
-        produced_gguf_files = list(local_scratch_dir.glob(f"{gguf_output_name}*.gguf"))
-        if not produced_gguf_files:
-            produced_gguf_files = list(local_scratch_dir.glob("*.gguf"))
+        # Locate produced final .gguf file(s) in scratch disk (search recursively)
+        produced_gguf_files = [f for f in local_scratch_dir.rglob("*.gguf") if f.is_file()]
+        # Filter out intermediate F16 files if quantized exists
+        quant_files = [f for f in produced_gguf_files if not f.name.endswith(".F16.gguf") and "f16" not in f.name.lower()]
+        if quant_files:
+            produced_gguf_files = quant_files
 
         if not produced_gguf_files:
             print(f"[!] Warning: No .gguf files found in {local_scratch_dir}")
         else:
             models_dir.mkdir(parents=True, exist_ok=True)
+            canonical_name = "qwen2.5-coder-1.5b-instruct-q4_k_m.gguf"
             for gguf_file in produced_gguf_files:
-                dest = models_dir / gguf_file.name
                 file_mb = gguf_file.stat().st_size / (1024 * 1024)
-                print(f"[*] Copying final quantized GGUF ({file_mb:.1f} MB) to persistent storage: {dest}...")
-                shutil.copy2(gguf_file, dest)
-                print(f"[+] Persisted {dest.name} -> {models_dir}")
+                for target_name in {gguf_file.name, canonical_name}:
+                    dest = models_dir / target_name
+                    print(f"[*] Copying final quantized GGUF ({file_mb:.1f} MB) to persistent storage: {dest}...")
+                    shutil.copy2(gguf_file, dest)
+                    print(f"[+] Persisted {dest.name} -> {models_dir}")
 
             # Also copy to local ~/.tsugi/models if different from models_dir
             local_user_models = Path.home() / ".tsugi" / "models"
             if local_user_models.resolve() != models_dir.resolve():
                 local_user_models.mkdir(parents=True, exist_ok=True)
-                for gguf_file in produced_gguf_files:
-                    dest = local_user_models / gguf_file.name
-                    if not dest.exists():
-                        shutil.copy2(gguf_file, dest)
-                        print(f"[+] Copied GGUF to local engine path: {dest}")
+                for target_name in {gguf_file.name, canonical_name}:
+                    dest = local_user_models / target_name
+                    shutil.copy2(gguf_file, dest)
+                    print(f"[+] Copied GGUF to local engine path: {dest}")
 
         print(f"\n[+] Training & GGUF export complete! Models saved in: {models_dir}")
         print("    Ready to test with: tsugi fix")
