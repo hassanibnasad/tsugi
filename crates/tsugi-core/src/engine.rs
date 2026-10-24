@@ -328,10 +328,19 @@ fn invoke_llama_cli(
         .arg("--no-display-prompt") // Don't echo the prompt back
         .arg("--log-disable"); // Suppress llama.cpp logs
 
-    // Add grammar constraint if file exists
-    if grammar_path.exists() {
-        cmd.arg("--grammar-file").arg(grammar_path);
+    // Ensure grammar file exists; do not silently skip
+    if !grammar_path.exists() {
+        if let Some(parent) = grammar_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        std::fs::write(grammar_path, TSUGI_PLAN_GBNF).map_err(|e| {
+            TsugiError::InferenceError(format!(
+                "Failed to materialize required grammar file at {}: {e}",
+                grammar_path.display()
+            ))
+        })?;
     }
+    cmd.arg("--grammar-file").arg(grammar_path);
 
     // Enable prompt lookup decoding for CPU speedup
     if prompt_lookup_decoding {
@@ -359,7 +368,7 @@ fn invoke_llama_cli(
     Ok(stdout.trim().to_string())
 }
 
-/// Attempt to query a local llama-server HTTP endpoint (default http://127.0.0.1:8080).
+/// Attempt to query a configured local llama-server HTTP endpoint.
 fn try_query_llama_server(
     server_url: Option<&str>,
     prompt: &str,
@@ -370,9 +379,9 @@ fn try_query_llama_server(
     use std::net::TcpStream;
     use std::time::Duration;
 
-    let url_str = server_url.unwrap_or("http://127.0.0.1:8080");
+    let url_str = server_url?;
     let trimmed = url_str.trim_start_matches("http://").trim_start_matches("https://");
-    let host_port = trimmed.split('/').next().unwrap_or("127.0.0.1:8080");
+    let host_port = trimmed.split('/').next()?;
     let addr: std::net::SocketAddr = host_port.parse().ok()?;
 
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(150)).ok()?;

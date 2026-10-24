@@ -59,10 +59,17 @@ pub fn save_config(config: &TsugiConfig) -> Result<(), TsugiError> {
 }
 
 /// Check if a local llama-server instance is actively listening.
+/// Returns false immediately if no URL is explicitly configured.
 pub fn is_llama_server_running(url: Option<&str>) -> bool {
-    let url_str = url.unwrap_or("http://127.0.0.1:8080");
+    let url_str = match url {
+        Some(u) if !u.trim().is_empty() => u.trim(),
+        _ => return false,
+    };
     let trimmed = url_str.trim_start_matches("http://").trim_start_matches("https://");
-    let host_port = trimmed.split('/').next().unwrap_or("127.0.0.1:8080");
+    let host_port = match trimmed.split('/').next() {
+        Some(hp) if !hp.is_empty() => hp,
+        _ => return false,
+    };
     if let Ok(addr) = host_port.parse() {
         std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(150)).is_ok()
     } else {
@@ -105,7 +112,7 @@ pub fn check_setup() -> SetupStatus {
             fallback_model: config.fallback_model_path.clone(),
             has_llama_cli,
             server_endpoint: if server_active {
-                Some(config.llama_server_url.unwrap_or_else(|| "http://127.0.0.1:8080".to_string()))
+                config.llama_server_url.clone()
             } else {
                 None
             },
