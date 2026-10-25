@@ -180,18 +180,54 @@ impl SafetyVault {
 
         // 2. Re-apply stash commit object if one was created
         if let Some(ref stash_sha) = snapshot.stash_sha {
-            let output = Command::new("git")
-                .args(["stash", "apply", stash_sha])
-                .current_dir(repo_path)
-                .output()
-                .map_err(|e| TsugiError::ExecutionFailed {
-                    cmd: "git stash apply".to_string(),
-                    reason: e.to_string(),
-                })?;
+            // Restore untracked files from stash parent 3 if present
+            if let Ok(u_parent) = rev_parse(repo_path, &format!("{stash_sha}^3")) {
+                debug!("SafetyVault: restoring untracked files from stash parent 3: {u_parent}");
+                let u_out = Command::new("git")
+                    .args(["checkout", &u_parent, "--", "."])
+                    .current_dir(repo_path)
+                    .output();
+                if let Ok(out) = u_out {
+                    if !out.status.success() {
+                        let stderr = String::from_utf8_lossy(&out.stderr);
+                        warn!("SafetyVault: checkout untracked files warning: {stderr}");
+                    }
+                }
+            }
 
-            if !output.status.success() {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                warn!("SafetyVault: stash apply had issues (expected if tree was clean): {stderr}");
+            // Check if this is a standard stash (has at least 2 parents)
+            let is_standard_stash = rev_parse(repo_path, &format!("{stash_sha}^2")).is_ok();
+
+            if is_standard_stash {
+                let output = Command::new("git")
+                    .args(["stash", "apply", stash_sha])
+                    .current_dir(repo_path)
+                    .output()
+                    .map_err(|e| TsugiError::ExecutionFailed {
+                        cmd: "git stash apply".to_string(),
+                        reason: e.to_string(),
+                    })?;
+
+                if !output.status.success() {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    warn!("SafetyVault: stash apply had issues (expected if tree was clean): {stderr}");
+                }
+            } else {
+                // For conflict snapshots, checkout the commit tree directly to restore working tree
+                debug!("SafetyVault: restoring working tree directly from conflict commit: {stash_sha}");
+                let output = Command::new("git")
+                    .args(["checkout", stash_sha, "--", "."])
+                    .current_dir(repo_path)
+                    .output()
+                    .map_err(|e| TsugiError::ExecutionFailed {
+                        cmd: format!("git checkout {stash_sha} -- ."),
+                        reason: e.to_string(),
+                    })?;
+
+                if !output.status.success() {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    warn!("SafetyVault: checkout tree warning: {stderr}");
+                }
             }
         }
 
@@ -305,18 +341,11 @@ fn create_stash_object(repo_path: &Path, head_sha: &str) -> Result<Option<String
             TsugiError::SnapshotFailed(format!("Failed to spawn git stash create: {e}"))
         })?;
 
-    // Fail-closed on error status (e.g. unmerged index entries / active conflicts)
+    // If git stash create fails (e.g. unmerged index entries / active conflicts),
+    // fallback to snapshotting the conflicted working tree state directly
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(TsugiError::SnapshotFailed(format!(
-            "git stash create failed with exit status {}: {}",
-            output.status.code().unwrap_or(-1),
-            if stderr.is_empty() {
-                "unmerged index entries or working tree conflict".to_string()
-            } else {
-                stderr
-            }
-        )));
+        debug!("SafetyVault: git stash create returned non-zero, creating conflict working tree snapshot");
+        return create_conflict_snapshot_object(repo_path, head_sha);
     }
 
     let raw_stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -506,6 +535,89 @@ fn rev_parse(repo_path: &Path, rev: &str) -> Result<String, TsugiError> {
         return Err(TsugiError::SnapshotFailed(format!("git rev-parse {rev} failed: {stderr}")));
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Helper to create a conflict working-tree snapshot when unmerged index entries prevent `git stash create`.
+fn create_conflict_snapshot_object(repo_path: &Path, head_sha: &str) -> Result<Option<String>, TsugiError> {
+    let repo = Repository::discover(repo_path).map_err(|e| {
+        TsugiError::SnapshotFailed(format!("Failed to discover repository for conflict snapshot: {e}"))
+    })?;
+    let git_dir = repo.path();
+    let tmp_index_path = git_dir.join(format!("tsugi_conflict_{}.idx", uuid::Uuid::new_v4().simple()));
+
+    // Populate temporary index with current working tree state (including conflict markers)
+    let add_output = Command::new("git")
+        .args(["add", "-A"])
+        .env("GIT_INDEX_FILE", &tmp_index_path)
+        .current_dir(repo_path)
+        .output()
+        .map_err(|e| {
+            let _ = std::fs::remove_file(&tmp_index_path);
+            TsugiError::SnapshotFailed(format!("Failed to add files for conflict snapshot: {e}"))
+        })?;
+
+    if !add_output.status.success() {
+        let _ = std::fs::remove_file(&tmp_index_path);
+        let stderr = String::from_utf8_lossy(&add_output.stderr);
+        return Err(TsugiError::SnapshotFailed(format!(
+            "git add -A for conflict snapshot failed: {stderr}"
+        )));
+    }
+
+    // Write tree for the temporary conflict index
+    let write_tree_output = Command::new("git")
+        .arg("write-tree")
+        .env("GIT_INDEX_FILE", &tmp_index_path)
+        .current_dir(repo_path)
+        .output()
+        .map_err(|e| {
+            let _ = std::fs::remove_file(&tmp_index_path);
+            TsugiError::SnapshotFailed(format!("Failed to write tree for conflict snapshot: {e}"))
+        })?;
+
+    let _ = std::fs::remove_file(&tmp_index_path);
+
+    if !write_tree_output.status.success() {
+        let stderr = String::from_utf8_lossy(&write_tree_output.stderr);
+        return Err(TsugiError::SnapshotFailed(format!(
+            "git write-tree for conflict snapshot failed: {stderr}"
+        )));
+    }
+
+    let tree_sha = String::from_utf8_lossy(&write_tree_output.stdout).trim().to_string();
+
+    // If working tree matches HEAD tree, no snapshot is needed
+    if let Ok(head_tree) = rev_parse(repo_path, "HEAD^{tree}") {
+        if head_tree == tree_sha {
+            debug!("SafetyVault: conflict snapshot tree matches HEAD, no snapshot needed");
+            return Ok(None);
+        }
+    }
+
+    // Create a commit object for the conflict state pointing to HEAD
+    let commit_output = Command::new("git")
+        .args([
+            "commit-tree",
+            "-m",
+            "tsugi snapshot: unmerged conflict working tree",
+            "-p",
+            head_sha,
+            &tree_sha,
+        ])
+        .current_dir(repo_path)
+        .output()
+        .map_err(|e| TsugiError::SnapshotFailed(format!("Failed to commit conflict snapshot: {e}")))?;
+
+    if !commit_output.status.success() {
+        let stderr = String::from_utf8_lossy(&commit_output.stderr);
+        return Err(TsugiError::SnapshotFailed(format!(
+            "git commit-tree for conflict snapshot failed: {stderr}"
+        )));
+    }
+
+    let commit_sha = String::from_utf8_lossy(&commit_output.stdout).trim().to_string();
+    info!("SafetyVault: created conflict working tree snapshot commit: {commit_sha}");
+    Ok(Some(commit_sha))
 }
 
 #[cfg(test)]
@@ -728,7 +840,7 @@ mod tests {
     }
 
     #[test]
-    fn test_safety_vault_fails_closed_on_unmerged_index_entries() {
+    fn test_safety_vault_snapshots_and_restores_unmerged_conflict_state() {
         let tmp = TempDir::new().unwrap();
         let repo = Repository::init(tmp.path()).unwrap();
         let file_path = tmp.path().join("conflict.txt");
@@ -775,11 +887,26 @@ mod tests {
         repo.merge(&[&b1_annotated], None, None).unwrap();
         assert!(repo.index().unwrap().has_conflicts());
 
-        // Checkpoint must fail-closed because index has unmerged entries
+        // Checkpoint MUST succeed now, snapshotting the active conflict state!
         let db_path = tmp.path().join("vault.sqlite");
         let vault = SafetyVault::open(&db_path).unwrap();
         let plan = test_plan();
-        let res = vault.checkpoint(tmp.path(), &plan);
-        assert!(res.is_err(), "Checkpoint should fail-closed on unmerged conflict state");
+        let snapshot = vault.checkpoint(tmp.path(), &plan).expect("Checkpoint should succeed on unmerged conflict state");
+        assert!(snapshot.stash_sha.is_some());
+
+        // Read original conflict text containing markers
+        let original_conflict_content = std::fs::read_to_string(&file_path).unwrap();
+        assert!(original_conflict_content.contains("<<<<<<<"));
+
+        // Simulate file modification or accidental corruption
+        std::fs::write(&file_path, "corrupted conflict resolution\n").unwrap();
+
+        // Roll back
+        let rolled_back = vault.rollback_latest(tmp.path()).unwrap();
+        assert!(rolled_back.is_some());
+
+        // Verify conflict state was restored accurately
+        let restored_content = std::fs::read_to_string(&file_path).unwrap();
+        assert_eq!(restored_content, original_conflict_content);
     }
 }
