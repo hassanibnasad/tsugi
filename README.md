@@ -35,24 +35,33 @@ Invokes the local GGUF model via `llama-cli` with GBNF grammar constraints for s
 ## Usage
 
 ```bash
-# Diagnose and fix the current Git issue
+# Automated zero-touch setup (downloads llama-cli & verified GGUF into ~/.tsugi/)
+tsugi setup
+
+# Check system readiness and model status
+tsugi status
+
+# Install fail-safe Git guard hooks (automatic <15ms snapshots before rebase/merge/checkout)
+tsugi guard install
+tsugi guard status
+
+# Shell failure integration (prints hint when any git command exits non-zero)
+tsugi init powershell | Out-String | Invoke-Expression    # PowerShell
+eval "$(tsugi init bash)"                                 # Bash
+eval "$(tsugi init zsh)"                                  # Zsh
+
+# Diagnose and fix the current Git issue (or interactive conflict resolution)
 tsugi fix "I messed up my rebase"
 tsugi fix                          # Auto-detect from repo state
 
 # Diagnose without executing (dry run)
 tsugi diagnose
 
-# Undo the last tsugi operation
+# Undo the last tsugi operation (restores pre-fix state)
 tsugi undo
 
 # View operation history
 tsugi history
-
-# Check setup status
-tsugi status
-
-# Initial setup wizard
-tsugi setup
 ```
 
 ## Hardware Requirements
@@ -89,25 +98,32 @@ cp target/release/tsugi ~/.local/bin/
 ```
 tsugi/
 ├── Cargo.toml                    # Workspace root
+├── MODEL_CARD.md                 # Model specifications, safety & benchmarks
 ├── grammars/
 │   └── tsugi_plan.gbnf           # GBNF grammar for constrained LLM output
 ├── crates/
 │   ├── tsugi-core/               # Core library (all 4 layers)
 │   │   └── src/
 │   │       ├── lib.rs            # Module declarations
-│   │       ├── types.rs          # Shared type definitions
-│   │       ├── probe.rs          # Layer 1: Git state probe (libgit2)
+│   │       ├── types.rs          # Shared type definitions (RepoState, ConflictHunk)
+│   │       ├── probe.rs          # Layer 1: Git state probe + conflict hunk extraction
 │   │       ├── tier0.rs          # Layer 2: Deterministic fast-path
-│   │       ├── engine.rs         # Layer 3: LLM inference bridge
+│   │       ├── engine.rs         # Layer 3: LLM inference bridge (llama-cli / server)
 │   │       ├── guardrail.rs      # Layer 4a: Safety policy engine
-│   │       ├── snapshot.rs       # Layer 4b: Shadow snapshot manager
-│   │       ├── ledger.rs         # Layer 4c: SQLite audit ledger
-│   │       ├── config.rs         # Configuration management
-│   │       ├── executor.rs       # Command executor
-│   │       └── formatter.rs      # Terminal output formatter
+│   │       ├── safety_vault.rs   # Layer 4b: Unified 3-parent snapshot & audit ledger
+│   │       ├── coordinator.rs    # Deep engine facade
+│   │       ├── config.rs         # Configuration & platform asset resolution
+│   │       ├── executor.rs       # Command executor & observers
+│   │       └── formatter.rs      # ANSI terminal & conflict diff formatter
 │   └── tsugi-cli/                # CLI binary
 │       └── src/
-│           └── main.rs           # Entry point + subcommand routing
+│           ├── lib.rs            # Clap CLI parser & command routing
+│           ├── setup.rs          # Zero-touch automated installer
+│           ├── downloader.rs     # Streaming downloader with SHA-256 verification
+│           ├── guard.rs          # Git guard hooks (<15ms auto-snapshots)
+│           ├── conflict_ui.rs    # Interactive 3-choice conflict resolver
+│           ├── shell.rs          # Shell failure integration hooks
+│           └── bin/              # tsugi & git-tsugi entry points
 └── README.md
 ```
 
