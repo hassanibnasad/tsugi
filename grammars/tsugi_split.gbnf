@@ -1,0 +1,18 @@
+# GBNF grammar for tsugi split (Conventional Commits)
+root ::= "{" ws
+    "\"summary\"" ws ":" ws string "," ws
+    "\"commits\"" ws ":" ws "[" ws commit-item ("," ws commit-item)* ws "]" ws
+    "}"
+
+commit-item ::= "{" ws
+    "\"commit_type\"" ws ":" ws commit-type "," ws
+    "\"scope\"" ws ":" ws (string | "null") "," ws
+    "\"message\"" ws ":" ws string "," ws
+    "\"explanation\"" ws ":" ws string "," ws
+    "\"files\"" ws ":" ws "[" ws string ("," ws string)* ws "]" ws
+    "}"
+
+commit-type ::= "\"feat\"" | "\"fix\"" | "\"docs\"" | "\"test\"" | "\"refactor\"" | "\"chore\"" | "\"style\"" | "\"perf\"" | "\"ci\""
+
+string ::= "\"" ([^"\\] | "\\" .)* "\""
+ws ::= [ \t\n]*
