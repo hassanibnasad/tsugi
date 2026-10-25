@@ -29,9 +29,14 @@ use clap::{Parser, Subcommand};
 use colored::Colorize;
 use tracing_subscriber::{fmt, EnvFilter};
 
+mod conflict_ui;
+mod downloader;
+mod guard;
+mod setup;
+mod shell;
+
 use tsugi_core::{
-    config::{self, check_setup, load_config, SetupStatus},
-    engine,
+    config::{check_setup, load_config, SetupStatus},
     formatter,
     probe,
     tier0,
@@ -100,8 +105,39 @@ enum Commands {
     /// Check tsugi setup status
     Status,
 
-    /// Interactive setup wizard
-    Setup,
+    /// Automated zero-touch setup wizard
+    Setup {
+        /// Skip downloading model and llama-cli binaries (for offline / CI environments)
+        #[arg(long)]
+        skip_download: bool,
+
+        /// Path to an existing local GGUF model file
+        #[arg(long)]
+        model_path: Option<PathBuf>,
+
+        /// Custom Hugging Face download URL for a GGUF model
+        #[arg(long)]
+        model_url: Option<String>,
+    },
+
+    /// Git Guard safety net: automatic pre-operation snapshots
+    Guard {
+        #[command(subcommand)]
+        action: GuardActions,
+    },
+
+    /// Silent fast checkpoint command invoked by Git guard hooks
+    #[command(hide = true)]
+    Checkpoint {
+        #[arg(long)]
+        quiet: bool,
+    },
+
+    /// Output shell integration script to hint tsugi on failed git commands
+    Init {
+        /// Shell type: powershell, bash, zsh, fish
+        shell: String,
+    },
 
     /// Clean up old snapshot refs (default: older than 30 days)
     Cleanup {
@@ -109,6 +145,24 @@ enum Commands {
         #[arg(short, long, default_value = "30")]
         days: u32,
     },
+}
+
+#[derive(Subcommand)]
+enum GuardActions {
+    /// Install guard hooks into .git/hooks/
+    Install {
+        /// Install hooks globally via git core.hooksPath
+        #[arg(long)]
+        global: bool,
+    },
+    /// Uninstall guard hooks
+    Uninstall {
+        /// Uninstall global guard hooks
+        #[arg(long)]
+        global: bool,
+    },
+    /// Check guard hook installation status
+    Status,
 }
 
 pub fn run() {
@@ -139,7 +193,20 @@ pub fn run() {
         Some(Commands::Undo) => cmd_undo(&repo_path),
         Some(Commands::History { limit }) => cmd_history(&repo_path, limit),
         Some(Commands::Status) => cmd_status(),
-        Some(Commands::Setup) => cmd_setup(),
+        Some(Commands::Setup { skip_download, model_path, model_url }) => {
+            setup::run_setup(setup::SetupOptions {
+                skip_download,
+                model_path,
+                model_url,
+            })
+        }
+        Some(Commands::Guard { action }) => match action {
+            GuardActions::Install { global } => guard::install_hooks(&repo_path, global),
+            GuardActions::Uninstall { global } => guard::uninstall_hooks(&repo_path, global),
+            GuardActions::Status => guard::guard_status(&repo_path),
+        },
+        Some(Commands::Checkpoint { quiet }) => guard::cmd_checkpoint(&repo_path, quiet),
+        Some(Commands::Init { shell }) => shell::print_shell_init(&shell),
         Some(Commands::Cleanup { days }) => cmd_cleanup(&repo_path, days),
         None => cmd_fix(&repo_path, "", cli.yes, cli.json),
     };
@@ -170,23 +237,60 @@ fn cmd_fix(repo_path: &PathBuf, user_intent: &str, auto_confirm: bool, json_outp
         formatter::print_diagnosis(&state);
     }
 
+    // Interactive quick-choice conflict resolution menu
+    if !auto_confirm && !json_output && !state.conflicts.is_empty() {
+        if let Some(conflict) = state.conflicts.iter().find(|c| c.primary_hunk.is_some()) {
+            match conflict_ui::prompt_conflict_resolution(conflict)? {
+                conflict_ui::ConflictChoice::KeepOurs => {
+                    conflict_ui::resolve_with_checkout(repo_path, &conflict.path, true)?;
+                    println!("  {} Run 'tsugi' to verify remaining status or continue operation.", "💡".cyan());
+                    return Ok(());
+                }
+                conflict_ui::ConflictChoice::KeepTheirs => {
+                    conflict_ui::resolve_with_checkout(repo_path, &conflict.path, false)?;
+                    println!("  {} Run 'tsugi' to verify remaining status or continue operation.", "💡".cyan());
+                    return Ok(());
+                }
+                conflict_ui::ConflictChoice::LetAiResolve => {
+                    println!("  {} Delegating conflict resolution to AI...", "▶".cyan());
+                }
+                conflict_ui::ConflictChoice::Cancel => {
+                    println!("  {} Conflict resolution cancelled.", "✖".red());
+                    return Ok(());
+                }
+            }
+        }
+    }
+
     // Layer 2 & 3: Produce a guardrail-checked plan
     let plan = match engine.plan(&state, user_intent)? {
         PlanOutcome::Ready(p) => p,
         PlanOutcome::SetupNeeded => {
-            if !json_output {
-                formatter::print_setup_needed();
-                println!(
-                    "\n  {} {}",
-                    "Hint:".cyan().bold(),
-                    "Tier-0 fast-path couldn't match this issue. A local AI model is needed."
-                );
-                println!(
-                    "  Run {} to set up the AI engine.",
-                    "tsugi setup".white().bold()
-                );
+            if !json_output && setup::ensure_model_lazy()? {
+                let reloaded_config = load_config().context("Failed to reload configuration")?;
+                let reloaded_engine = TsugiEngine::new(reloaded_config)?;
+                match reloaded_engine.plan(&state, user_intent)? {
+                    PlanOutcome::Ready(p) => p,
+                    PlanOutcome::SetupNeeded => {
+                        formatter::print_setup_needed();
+                        return Ok(());
+                    }
+                }
+            } else {
+                if !json_output {
+                    formatter::print_setup_needed();
+                    println!(
+                        "\n  {} {}",
+                        "Hint:".cyan().bold(),
+                        "Tier-0 fast-path couldn't match this issue. A local AI model is needed."
+                    );
+                    println!(
+                        "  Run {} to set up the AI engine.",
+                        "tsugi setup".white().bold()
+                    );
+                }
+                return Ok(());
             }
-            return Ok(());
         }
     };
 
@@ -390,50 +494,6 @@ fn cmd_status() -> Result<()> {
     Ok(())
 }
 
-fn cmd_setup() -> Result<()> {
-    formatter::print_banner();
-
-    println!("\n  {}", "Setup Wizard".white().bold());
-    println!("  {}", "─────────────".dimmed());
-
-    println!("\n  tsugi requires two components:");
-    println!("  1. A GGUF model file (Qwen2.5-Coder-1.5B-Instruct, ~840 MB)");
-    println!("  2. llama-cli (the inference engine from llama.cpp)");
-
-    println!("\n  {} Download the model:", "Step 1:".cyan().bold());
-    println!("    Visit: {}", "https://huggingface.co/Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF".dimmed());
-    println!("    Download: {}", "qwen2.5-coder-1.5b-instruct-q4_k_m.gguf".white().bold());
-    println!("    Place it in: {}", config::models_dir().display());
-
-    println!("\n  {} Install llama-cli:", "Step 2:".cyan().bold());
-    println!("    Visit: {}", "https://github.com/ggerganov/llama.cpp/releases".dimmed());
-    println!("    Download the release for your OS and add llama-cli to your PATH.");
-
-    println!("\n  {} Configure tsugi:", "Step 3:".cyan().bold());
-
-    let models_dir = config::models_dir();
-    std::fs::create_dir_all(&models_dir)?;
-
-    let mut config = load_config().unwrap_or_default();
-    config.primary_model_path = Some(models_dir.join("qwen2.5-coder-1.5b-instruct-q4_k_m.gguf"));
-    config.fallback_model_path = Some(models_dir.join("qwen3-0.6b-q5_k_m.gguf"));
-
-    // Create GBNF grammar file
-    let grammar_path = config::config_dir().join("tsugi_plan.gbnf");
-    engine::ensure_grammar_file(&grammar_path)?;
-    config.grammar_path = Some(grammar_path);
-
-    config::save_config(&config)?;
-
-    println!("    {} Configuration saved!", "✔".green().bold());
-
-    println!(
-        "\n  Once you've completed steps 1-2, run {} to verify.",
-        "tsugi status".white().bold()
-    );
-
-    Ok(())
-}
 
 fn cmd_cleanup(repo_path: &PathBuf, days: u32) -> Result<()> {
     formatter::print_banner();
