@@ -60,6 +60,10 @@ tsugi diagnose
 # Undo the last tsugi operation (restores pre-fix state)
 tsugi undo
 
+# Autonomously split messy working tree changes into atomic, logical commits
+tsugi split --dry-run                  # Preview proposed commit clusters
+tsugi split                            # Interactive review & progressive commit
+
 # View operation history
 tsugi history
 ```
