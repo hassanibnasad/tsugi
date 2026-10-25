@@ -464,6 +464,7 @@ mod tests {
         state.conflicts = vec![ConflictEntry {
             path: "src/auth.ts".to_string(),
             conflict_type: ConflictType::BothModified,
+            primary_hunk: None,
         }];
 
         // When conflicts are present, Tier-0 must NOT hijack; it defers to the LLM

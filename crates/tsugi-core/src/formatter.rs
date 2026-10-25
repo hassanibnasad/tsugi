@@ -57,6 +57,20 @@ pub fn print_diagnosis(state: &RepoState) {
                 conflict.path.white(),
                 format!("{}", conflict.conflict_type).dimmed()
             );
+
+            if let Some(ref hunk) = conflict.primary_hunk {
+                println!("       {} {}", "┌── Conflict block in".dimmed(), hunk.file_path.cyan());
+                println!("       {} <<<<<<< {}", "│".dimmed(), hunk.ours_branch.yellow().bold());
+                for line in &hunk.ours_content {
+                    println!("       {} {}", "│".dimmed(), line.green());
+                }
+                println!("       {} =======", "│".dimmed());
+                for line in &hunk.theirs_content {
+                    println!("       {} {}", "│".dimmed(), line.red());
+                }
+                println!("       {} >>>>>>> {}", "│".dimmed(), hunk.theirs_branch.yellow().bold());
+                println!("       {}", "└──".dimmed());
+            }
         }
     }
 

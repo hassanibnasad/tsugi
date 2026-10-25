@@ -95,11 +95,24 @@ pub enum OngoingOperation {
     ApplyMailbox,
 }
 
+/// Extracted conflict hunk lines for inspection and resolution.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConflictHunk {
+    pub file_path: String,
+    pub ours_branch: String,
+    pub theirs_branch: String,
+    pub ours_content: Vec<String>,
+    pub theirs_content: Vec<String>,
+    pub total_lines: usize,
+}
+
 /// A file with an active conflict.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConflictEntry {
     pub path: String,
     pub conflict_type: ConflictType,
+    #[serde(default)]
+    pub primary_hunk: Option<ConflictHunk>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -315,6 +328,10 @@ pub struct TsugiConfig {
     /// Optional HTTP endpoint for local llama-server (e.g. "http://127.0.0.1:8080").
     #[serde(default)]
     pub llama_server_url: Option<String>,
+
+    /// Explicit path to llama-cli executable.
+    #[serde(default)]
+    pub llama_cli_path: Option<PathBuf>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -465,6 +482,17 @@ impl RepoState {
                 .map(|c| format!("\"{}\" ({})", c.path, c.conflict_type))
                 .collect();
             lines.push(format!("CONFLICTS: [{}]", conflict_list.join(", ")));
+
+            // Include primary conflict hunk context if available
+            for c in &self.conflicts {
+                if let Some(ref hunk) = c.primary_hunk {
+                    lines.push(format!(
+                        "CONFLICT_HUNK: \"{}\" ours<{}> vs theirs<{}> ({} lines)",
+                        hunk.file_path, hunk.ours_branch, hunk.theirs_branch, hunk.total_lines
+                    ));
+                    break;
+                }
+            }
         }
 
         let wt = &self.working_tree;
@@ -529,6 +557,7 @@ impl Default for TsugiConfig {
             n_threads: num_cpus(),
             prompt_lookup_decoding: true,
             llama_server_url: None,
+            llama_cli_path: None,
         }
     }
 }

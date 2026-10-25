@@ -19,7 +19,7 @@ use git2::{
 use tracing::{debug, warn};
 
 use crate::types::{
-    CommitEntry, ConflictEntry, ConflictType, HeadState, OngoingOperation, ReflogEntry, RepoState,
+    CommitEntry, ConflictEntry, ConflictHunk, ConflictType, HeadState, OngoingOperation, ReflogEntry, RepoState,
     TrackingInfo, TsugiError, WorkingTreeSummary,
 };
 
@@ -242,12 +242,71 @@ fn probe_conflicts(repo: &Repository) -> Vec<ConflictEntry> {
                 (None, None) => ConflictType::Unknown,
             };
 
+            let primary_hunk = extract_conflict_hunk(repo.workdir(), &path_str);
+
             Some(ConflictEntry {
                 path: path_str,
                 conflict_type,
+                primary_hunk,
             })
         })
         .collect()
+}
+
+/// Helper to parse the first conflict block (max 20 lines) from a conflicting file.
+fn extract_conflict_hunk(workdir: Option<&Path>, rel_path: &str) -> Option<ConflictHunk> {
+    let base = workdir?;
+    let full_path = base.join(rel_path);
+    let content = std::fs::read_to_string(&full_path).ok()?;
+
+    let mut in_ours = false;
+    let mut in_theirs = false;
+    let mut ours_branch = "HEAD".to_string();
+    let mut theirs_branch = "incoming".to_string();
+    let mut ours_content = Vec::new();
+    let mut theirs_content = Vec::new();
+    let mut total_lines = 0;
+
+    for line in content.lines() {
+        if line.starts_with("<<<<<<< ") {
+            in_ours = true;
+            ours_branch = line.trim_start_matches("<<<<<<< ").trim().to_string();
+            continue;
+        }
+        if in_ours && line.starts_with("=======") {
+            in_ours = false;
+            in_theirs = true;
+            continue;
+        }
+        if in_theirs && line.starts_with(">>>>>>> ") {
+            theirs_branch = line.trim_start_matches(">>>>>>> ").trim().to_string();
+            break;
+        }
+        if in_ours {
+            if ours_content.len() < 20 {
+                ours_content.push(line.to_string());
+            }
+            total_lines += 1;
+        } else if in_theirs {
+            if theirs_content.len() < 20 {
+                theirs_content.push(line.to_string());
+            }
+            total_lines += 1;
+        }
+    }
+
+    if !ours_content.is_empty() || !theirs_content.is_empty() {
+        Some(ConflictHunk {
+            file_path: rel_path.to_string(),
+            ours_branch,
+            theirs_branch,
+            ours_content,
+            theirs_content,
+            total_lines,
+        })
+    } else {
+        None
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
