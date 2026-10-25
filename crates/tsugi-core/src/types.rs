@@ -152,6 +152,62 @@ impl WorkingTreeSummary {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Commit Splitting Types
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Status of a changed file in the working tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FileDeltaStatus {
+    Added,
+    Modified,
+    Deleted,
+    Renamed,
+    Untracked,
+}
+
+impl std::fmt::Display for FileDeltaStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Added => write!(f, "added"),
+            Self::Modified => write!(f, "modified"),
+            Self::Deleted => write!(f, "deleted"),
+            Self::Renamed => write!(f, "renamed"),
+            Self::Untracked => write!(f, "untracked"),
+        }
+    }
+}
+
+/// Metadata for a changed file in the working tree.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChangedFile {
+    pub path: String,
+    pub status: FileDeltaStatus,
+    pub additions: usize,
+    pub deletions: usize,
+    /// Up to 10 lines of leading diff summary for semantic categorization
+    pub diff_preview: String,
+}
+
+/// A single proposed commit within a split plan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProposedCommit {
+    pub commit_type: String,       // feat, fix, docs, test, refactor, chore, perf, style, ci
+    pub scope: Option<String>,     // e.g. core, cli, safety, deps
+    pub message: String,           // Conventional Commit message: "feat(core): add safety vault"
+    pub explanation: String,       // Why these files are grouped together
+    pub files: Vec<String>,        // File paths belonging to this commit
+}
+
+/// Full execution plan for splitting working tree changes into atomic commits.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SplitCommitPlan {
+    pub summary: String,
+    pub commits: Vec<ProposedCommit>,
+    #[serde(default)]
+    pub unassigned_files: Vec<String>,
+}
+
 /// A single commit entry for the recent log.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommitEntry {

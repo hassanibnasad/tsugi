@@ -31,8 +31,12 @@ use crate::guardrail;
 use crate::ledger::OperationRecord;
 use crate::probe;
 use crate::safety_vault::SafetyVault;
+use crate::split_inference;
 use crate::tier0;
-use crate::types::{RepoState, ResolutionPlan, RiskTier, SnapshotRecord, TsugiConfig, TsugiError};
+use crate::tier0_split;
+use crate::types::{
+    RepoState, ResolutionPlan, RiskTier, SnapshotRecord, SplitCommitPlan, TsugiConfig, TsugiError,
+};
 
 /// Outcome of the diagnostic planning phase.
 #[derive(Debug, Clone)]
@@ -231,6 +235,115 @@ impl TsugiEngine {
         self.vault.cleanup(repo_path, days)
     }
 
+    /// Layer 1 + 2/3: Enumerate changed files and construct an atomic split commit plan.
+    pub fn plan_split(&self, repo_path: &Path) -> Result<SplitCommitPlan, TsugiError> {
+        let changed = probe::probe_changed_files(repo_path)?;
+        if changed.is_empty() {
+            return Err(TsugiError::ExecutionFailed {
+                cmd: "tsugi split".to_string(),
+                reason: "Working tree is completely clean. No changes to split.".to_string(),
+            });
+        }
+
+        // Try Tier-0 deterministic heuristic clustering first
+        if let Some(t0_plan) = tier0_split::try_partition_changes(&changed) {
+            info!("Tier-0 split heuristics matched {} commits", t0_plan.commits.len());
+            return Ok(t0_plan);
+        }
+
+        // Fall back to local SLM inference
+        split_inference::split_with_llm(&changed, &self.config)
+    }
+
+    /// Layer 4: Progressively execute the commits in a SplitCommitPlan under safety snapshot protection.
+    pub fn execute_split(
+        &self,
+        repo_path: &Path,
+        plan: &SplitCommitPlan,
+        _observer: &dyn ExecutionObserver,
+    ) -> Result<Vec<String>, TsugiError> {
+        if plan.commits.is_empty() {
+            return Err(TsugiError::ExecutionFailed {
+                cmd: "tsugi split".to_string(),
+                reason: "Split plan contains no commits".to_string(),
+            });
+        }
+
+        // 1. Create a shadow safety checkpoint before any changes
+        let synth_plan = ResolutionPlan {
+            root_cause: format!("Pre-split snapshot: {}", plan.summary),
+            risk_tier: RiskTier::HistoryRewrite,
+            execution_steps: vec![],
+            rollback_cmd: "git reset --soft HEAD~".to_string(),
+            source: crate::types::PlanSource::Tier0,
+            confidence: 1.0,
+        };
+        let snapshot = self.vault.checkpoint(repo_path, &synth_plan)?;
+        info!("Safety checkpoint {} created before split commits", snapshot.id);
+
+        let mut executed_commits = Vec::new();
+
+        // 2. Execute each commit in sequence
+        for (idx, commit) in plan.commits.iter().enumerate() {
+            info!("Staging and committing cluster {}/{}: {}", idx + 1, plan.commits.len(), commit.message);
+
+            // Stage only the files for this commit
+            let mut add_cmd = std::process::Command::new("git");
+            add_cmd.arg("add").arg("--");
+            for file in &commit.files {
+                add_cmd.arg(file);
+            }
+            add_cmd.current_dir(repo_path);
+
+            let add_out = add_cmd.output().map_err(|e| TsugiError::ExecutionFailed {
+                cmd: format!("git add for commit {}", commit.message),
+                reason: e.to_string(),
+            })?;
+
+            if !add_out.status.success() {
+                let err = String::from_utf8_lossy(&add_out.stderr);
+                let _ = self.vault.rollback_snapshot(repo_path, &snapshot);
+                return Err(TsugiError::ExecutionFailed {
+                    cmd: format!("git add for {}", commit.message),
+                    reason: format!("Failed staging files: {err}"),
+                });
+            }
+
+            // Execute git commit -m
+            let commit_out = std::process::Command::new("git")
+                .args(["commit", "-m", &commit.message])
+                .current_dir(repo_path)
+                .output()
+                .map_err(|e| TsugiError::ExecutionFailed {
+                    cmd: format!("git commit -m \"{}\"", commit.message),
+                    reason: e.to_string(),
+                })?;
+
+            if !commit_out.status.success() {
+                let err = String::from_utf8_lossy(&commit_out.stderr);
+                let _ = self.vault.rollback_snapshot(repo_path, &snapshot);
+                return Err(TsugiError::ExecutionFailed {
+                    cmd: format!("git commit -m \"{}\"", commit.message),
+                    reason: format!("Failed committing changes: {err}"),
+                });
+            }
+
+            executed_commits.push(commit.message.clone());
+        }
+
+        // Record execution in audit ledger
+        self.vault.record_execution(
+            &repo_path.to_string_lossy(),
+            "tsugi split",
+            &synth_plan,
+            &executed_commits,
+            true,
+            Some(&snapshot.id),
+        )?;
+
+        Ok(executed_commits)
+    }
+
     /// Access the underlying SafetyVault directly.
     pub fn vault(&self) -> &SafetyVault {
         &self.vault
@@ -311,5 +424,56 @@ mod tests {
         // Since dummy.gguf doesn't exist, check_setup() reports SetupNeeded or Ready
         // If SetupNeeded, outcome is SetupNeeded
         assert!(matches!(plan_outcome, PlanOutcome::Ready(_) | PlanOutcome::SetupNeeded));
+    }
+
+    #[test]
+    fn test_tsugi_engine_plan_and_execute_split() {
+        let tmp = TempDir::new().unwrap();
+        let repo = git2::Repository::init(tmp.path()).unwrap();
+
+        // 1. Initial commit
+        let init_file = tmp.path().join("init.txt");
+        std::fs::write(&init_file, "init\n").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("init.txt")).unwrap();
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let sig = git2::Signature::now("Test", "test@test.com").unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "Initial commit", &tree, &[]).unwrap();
+
+        // 2. Add two files across two distinct subsystems
+        let doc_dir = tmp.path().join("docs");
+        std::fs::create_dir_all(&doc_dir).unwrap();
+        std::fs::write(doc_dir.join("api.md"), "# API\n").unwrap();
+
+        let core_dir = tmp.path().join("crates").join("tsugi-core");
+        std::fs::create_dir_all(&core_dir).unwrap();
+        std::fs::write(core_dir.join("lib.rs"), "// core\n").unwrap();
+
+        let db_tmp = TempDir::new().unwrap();
+        let db_path = db_tmp.path().join("ledger.sqlite");
+        let vault = SafetyVault::open(&db_path).unwrap();
+        let inference = Box::new(MockInferenceBackend::with_default_test_plan());
+        let config = TsugiConfig::default();
+        let engine = TsugiEngine::with_components(config, vault, inference);
+
+        // 3. Plan split (should match Tier-0)
+        let plan = engine.plan_split(tmp.path()).expect("plan split should succeed");
+        assert_eq!(plan.commits.len(), 2);
+
+        // 4. Execute split
+        let observer = CapturingObserver::new(true);
+        let executed = engine.execute_split(tmp.path(), &plan, &observer).expect("execute split");
+        assert_eq!(executed.len(), 2);
+
+        // 5. Verify commits in git
+        let head = repo.head().unwrap();
+        let latest_commit = head.peel_to_commit().unwrap();
+        assert_eq!(latest_commit.parent_count(), 1);
+
+        // 6. Test undo: should revert the split
+        let undo_res = engine.undo(tmp.path()).expect("undo split");
+        assert!(undo_res.is_some());
     }
 }

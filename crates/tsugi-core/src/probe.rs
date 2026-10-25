@@ -19,8 +19,8 @@ use git2::{
 use tracing::{debug, warn};
 
 use crate::types::{
-    CommitEntry, ConflictEntry, ConflictHunk, ConflictType, HeadState, OngoingOperation, ReflogEntry, RepoState,
-    TrackingInfo, TsugiError, WorkingTreeSummary,
+    ChangedFile, CommitEntry, ConflictEntry, ConflictHunk, ConflictType, FileDeltaStatus, HeadState,
+    OngoingOperation, ReflogEntry, RepoState, TrackingInfo, TsugiError, WorkingTreeSummary,
 };
 
 /// Maximum number of recent commits to include in the fact sheet.
@@ -577,6 +577,121 @@ fn compute_safe_rollback(
     None
 }
 
+/// Enumerate all changed, untracked, or deleted files in the repository with delta metrics and preview.
+pub fn probe_changed_files(path: &Path) -> Result<Vec<ChangedFile>, TsugiError> {
+    let repo = Repository::discover(path).map_err(|_| TsugiError::RepoNotFound {
+        path: path.to_path_buf(),
+    })?;
+
+    let repo_root = repo
+        .workdir()
+        .unwrap_or_else(|| repo.path())
+        .to_path_buf();
+
+    let mut opts = StatusOptions::new();
+    opts.show(StatusShow::IndexAndWorkdir)
+        .include_untracked(true)
+        .recurse_untracked_dirs(true)
+        .include_ignored(false);
+
+    let statuses = repo.statuses(Some(&mut opts)).map_err(|e| {
+        TsugiError::SnapshotFailed(format!("Failed to query repository status: {e}"))
+    })?;
+
+    let mut results = Vec::new();
+
+    for entry in statuses.iter() {
+        let status = entry.status();
+        let path_str = match entry.path() {
+            Ok(p) => p.to_string(),
+            Err(_) => continue,
+        };
+
+        let file_status = if status.is_wt_new() {
+            FileDeltaStatus::Untracked
+        } else if status.is_index_new() {
+            FileDeltaStatus::Added
+        } else if status.is_index_deleted() || status.is_wt_deleted() {
+            FileDeltaStatus::Deleted
+        } else if status.is_index_renamed() {
+            FileDeltaStatus::Renamed
+        } else {
+            FileDeltaStatus::Modified
+        };
+
+        let (additions, deletions, diff_preview) =
+            extract_file_diff_preview(&repo_root, &path_str, file_status);
+
+        results.push(ChangedFile {
+            path: path_str,
+            status: file_status,
+            additions,
+            deletions,
+            diff_preview,
+        });
+    }
+
+    Ok(results)
+}
+
+/// Helper to compute lines added/deleted and a concise preview snippet for a file.
+fn extract_file_diff_preview(
+    repo_root: &Path,
+    rel_path: &str,
+    status: FileDeltaStatus,
+) -> (usize, usize, String) {
+    let full_path = repo_root.join(rel_path);
+
+    if status == FileDeltaStatus::Untracked || status == FileDeltaStatus::Added {
+        if let Ok(content) = std::fs::read_to_string(&full_path) {
+            let lines: Vec<&str> = content.lines().collect();
+            let total = lines.len();
+            let preview = lines
+                .iter()
+                .take(8)
+                .map(|l| format!("+{l}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            return (total, 0, preview);
+        }
+        return (0, 0, String::new());
+    }
+
+    // For modified or deleted files, query git diff against HEAD
+    let output = std::process::Command::new("git")
+        .args(["diff", "HEAD", "-U1", "--", rel_path])
+        .current_dir(repo_root)
+        .output();
+
+    if let Ok(out) = output {
+        let diff_str = String::from_utf8_lossy(&out.stdout);
+        let mut adds = 0;
+        let mut dels = 0;
+        let mut preview_lines = Vec::new();
+
+        for line in diff_str.lines() {
+            if line.starts_with("+++") || line.starts_with("---") || line.starts_with("diff ") || line.starts_with("index ") {
+                continue;
+            }
+            if line.starts_with('+') {
+                adds += 1;
+                if preview_lines.len() < 8 {
+                    preview_lines.push(line.to_string());
+                }
+            } else if line.starts_with('-') {
+                dels += 1;
+                if preview_lines.len() < 8 {
+                    preview_lines.push(line.to_string());
+                }
+            }
+        }
+
+        return (adds, dels, preview_lines.join("\n"));
+    }
+
+    (0, 0, String::new())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -652,4 +767,39 @@ mod tests {
         assert!(fact_sheet.contains("ONGOING_OP: NONE"));
         assert!(fact_sheet.contains("CONFLICTS: NONE"));
     }
+
+    #[test]
+    fn test_probe_changed_files() {
+        let (tmp, repo) = init_test_repo();
+
+        // 1. Initial commit
+        let f1 = tmp.path().join("base.txt");
+        std::fs::write(&f1, "base content\n").expect("write f1");
+
+        let mut index = repo.index().expect("index");
+        index.add_path(Path::new("base.txt")).expect("add base");
+        index.write().expect("write index");
+        let tree_id = index.write_tree().expect("tree");
+        let tree = repo.find_tree(tree_id).expect("find tree");
+        let sig = git2::Signature::now("Test", "test@test.com").expect("sig");
+        repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[]).expect("commit");
+
+        // 2. Modify base.txt
+        std::fs::write(&f1, "base content\nadded line\n").expect("modify f1");
+
+        // 3. Add an untracked file
+        let f2 = tmp.path().join("docs.md");
+        std::fs::write(&f2, "# Documentation\nMore docs\n").expect("write f2");
+
+        let changed = probe_changed_files(tmp.path()).expect("probe changed");
+        assert_eq!(changed.len(), 2);
+
+        let base_entry = changed.iter().find(|c| c.path == "base.txt").expect("found base");
+        assert_eq!(base_entry.status, FileDeltaStatus::Modified);
+
+        let docs_entry = changed.iter().find(|c| c.path == "docs.md").expect("found docs");
+        assert_eq!(docs_entry.status, FileDeltaStatus::Untracked);
+        assert_eq!(docs_entry.additions, 2);
+    }
 }
+
