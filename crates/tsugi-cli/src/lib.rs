@@ -34,6 +34,7 @@ mod downloader;
 mod guard;
 mod setup;
 mod shell;
+mod split_ui;
 
 use tsugi_core::{
     config::{check_setup, load_config, SetupStatus},
@@ -145,6 +146,13 @@ enum Commands {
         #[arg(short, long, default_value = "30")]
         days: u32,
     },
+
+    /// Split uncommitted working tree changes into atomic, logical commits
+    Split {
+        /// Preview proposed commits without executing them
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -208,6 +216,7 @@ pub fn run() {
         Some(Commands::Checkpoint { quiet }) => guard::cmd_checkpoint(&repo_path, quiet),
         Some(Commands::Init { shell }) => shell::print_shell_init(&shell),
         Some(Commands::Cleanup { days }) => cmd_cleanup(&repo_path, days),
+        Some(Commands::Split { dry_run }) => cmd_split(&repo_path, dry_run, cli.yes, cli.json),
         None => cmd_fix(&repo_path, "", cli.yes, cli.json),
     };
 
@@ -510,6 +519,54 @@ fn cmd_cleanup(repo_path: &PathBuf, days: u32) -> Result<()> {
         cleaned,
         days
     );
+
+    Ok(())
+}
+
+fn cmd_split(repo_path: &PathBuf, dry_run: bool, auto_confirm: bool, json_output: bool) -> Result<()> {
+    if !json_output {
+        formatter::print_banner();
+    }
+
+    let config = load_config().context("Failed to load configuration")?;
+    let engine = TsugiEngine::new(config)?;
+
+    let plan = engine.plan_split(repo_path)?;
+
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&plan)?);
+        return Ok(());
+    }
+
+    split_ui::print_split_plan(&plan);
+
+    if dry_run {
+        println!("  {} Dry run mode enabled. No commits were created.", "ℹ".cyan());
+        return Ok(());
+    }
+
+    if !auto_confirm {
+        let confirmed = split_ui::prompt_split_confirmation()?;
+        if !confirmed {
+            println!("  {} Commit split cancelled. Working tree untouched.", "✖".red());
+            return Ok(());
+        }
+    }
+
+    println!("\n{}", "─── Executing Progressive Commits ─────────".dimmed());
+
+    let observer = TerminalObserver::new(auto_confirm);
+    let executed = engine.execute_split(repo_path, &plan, &observer)?;
+
+    println!(
+        "\n  {} Successfully created {} atomic commit(s)!",
+        "✔".green().bold(),
+        executed.len().to_string().cyan().bold()
+    );
+    for msg in &executed {
+        println!("    · {}", msg.green());
+    }
+    println!("\n  {} Run 'tsugi undo' if you want to revert these commits.", "💡".cyan());
 
     Ok(())
 }
