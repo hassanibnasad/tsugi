@@ -32,6 +32,9 @@ use tracing_subscriber::{fmt, EnvFilter};
 mod conflict_ui;
 mod downloader;
 mod guard;
+mod pr_check;
+mod recover;
+mod repl;
 mod setup;
 mod shell;
 mod split_ui;
@@ -153,6 +156,42 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
+
+    /// Start interactive conversational Git co-pilot session
+    Chat,
+
+    /// Explain a Git command or strategy in plain English
+    Explain {
+        /// Git command to explain (e.g. "rebase --onto", "merge --ff-only")
+        #[arg(trailing_var_arg = true)]
+        cmd: Vec<String>,
+    },
+
+    /// Audit active branch for PR readiness (conventional commits, linear history, secret scan)
+    #[command(name = "pr-ready")]
+    PrReady {
+        /// Target base branch to compare against (defaults to main/master)
+        #[arg(short, long)]
+        base: Option<String>,
+    },
+
+    /// Search for lost, deleted, or dangling commits using reflog and fsck
+    Recover {
+        /// Maximum number of recovered commits to display
+        #[arg(short, long, default_value = "10")]
+        limit: usize,
+    },
+
+    /// View and analyze commit history with Conventional Commits metrics
+    Log {
+        /// Maximum number of commits to inspect
+        #[arg(short, long, default_value = "30")]
+        limit: usize,
+
+        /// Run commit graph intelligence analysis
+        #[arg(long)]
+        analyze: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -217,7 +256,18 @@ pub fn run() {
         Some(Commands::Init { shell }) => shell::print_shell_init(&shell),
         Some(Commands::Cleanup { days }) => cmd_cleanup(&repo_path, days),
         Some(Commands::Split { dry_run }) => cmd_split(&repo_path, dry_run, cli.yes, cli.json),
-        None => cmd_fix(&repo_path, "", cli.yes, cli.json),
+        Some(Commands::Chat) => cmd_chat(&repo_path),
+        Some(Commands::Explain { cmd }) => cmd_explain(&repo_path, &cmd.join(" ")),
+        Some(Commands::PrReady { base }) => cmd_pr_ready(&repo_path, base.as_deref()),
+        Some(Commands::Recover { limit }) => cmd_recover(&repo_path, limit),
+        Some(Commands::Log { limit, analyze }) => cmd_log(&repo_path, limit, analyze),
+        None => {
+            if cli.json {
+                cmd_fix(&repo_path, "", cli.yes, cli.json)
+            } else {
+                cmd_chat(&repo_path)
+            }
+        }
     };
 
     if let Err(e) = result {
@@ -568,6 +618,62 @@ fn cmd_split(repo_path: &PathBuf, dry_run: bool, auto_confirm: bool, json_output
     }
     println!("\n  {} Run 'tsugi undo' if you want to revert these commits.", "💡".cyan());
 
+    Ok(())
+}
+
+fn cmd_chat(repo_path: &PathBuf) -> Result<()> {
+    formatter::print_banner();
+    let config = load_config().context("Failed to load configuration")?;
+    let engine = TsugiEngine::new(config)?;
+    let mut session = repl::ReplSession::new(repo_path.clone(), engine);
+    session.start()
+}
+
+fn cmd_explain(repo_path: &PathBuf, cmd_str: &str) -> Result<()> {
+    formatter::print_banner();
+    let config = load_config().unwrap_or_default();
+    let state = probe::probe_repo_state(repo_path).ok();
+    let explanation = tsugi_core::explain::explain_command(cmd_str, state.as_ref(), &config)?;
+    println!("\n  {} Command Explanation:\n", "💡".cyan().bold());
+    println!("  {}\n", explanation.white());
+    Ok(())
+}
+
+fn cmd_pr_ready(repo_path: &PathBuf, base: Option<&str>) -> Result<()> {
+    formatter::print_banner();
+    let report = pr_check::run_pr_check(repo_path, base)?;
+    report.print_summary();
+    Ok(())
+}
+
+fn cmd_recover(repo_path: &PathBuf, limit: usize) -> Result<()> {
+    formatter::print_banner();
+    let commits = recover::find_lost_commits(repo_path, limit)?;
+    recover::print_recovery_list(&commits);
+    Ok(())
+}
+
+fn cmd_log(repo_path: &PathBuf, limit: usize, analyze: bool) -> Result<()> {
+    formatter::print_banner();
+    let state = probe::probe_repo_state(repo_path)?;
+    println!("\n  {} Recent Commits (last {}):", "📜".cyan().bold(), state.recent_commits.len().min(limit));
+    for c in state.recent_commits.iter().take(limit) {
+        println!("    {} {} - {}", c.sha_short.yellow().bold(), c.message_oneline.white(), c.author.dimmed());
+    }
+
+    if analyze {
+        let report = tsugi_core::log_analysis::analyze_commits(&state.recent_commits);
+        println!("\n  {} Commit Graph Intelligence Analysis:", "📊".cyan().bold());
+        println!("    • Conventional Commits Compliance: {:.1}%", report.conventional_compliance_pct);
+        println!("    • WIP / Fixup Commits Detected: {}", report.wip_commits_count);
+        println!("    • Merge Commits in History: {}", report.merge_commits_count);
+        if !report.recommendations.is_empty() {
+            println!("\n  {} Recommendations:", "💡".cyan().bold());
+            for rec in &report.recommendations {
+                println!("    • {}", rec.yellow());
+            }
+        }
+    }
     Ok(())
 }
 
