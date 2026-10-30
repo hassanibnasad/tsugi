@@ -130,6 +130,30 @@ pub fn print_diagnosis(state: &RepoState) {
         );
     }
 
+    // Submodules
+    if !state.submodules.is_empty() {
+        let uninit = state.submodules.iter().filter(|s| !s.is_initialized).count();
+        let dirty = state.submodules.iter().filter(|s| s.is_dirty).count();
+        if uninit > 0 || dirty > 0 {
+            println!("  🧩 Submodules: {} ({} uninit, {} dirty)", state.submodules.len().to_string().yellow(), uninit, dirty);
+        }
+    }
+
+    // Worktrees
+    if state.worktrees.len() > 1 {
+        println!("  🌲 Worktrees: {} active linked worktrees", state.worktrees.len().to_string().cyan());
+    }
+
+    // Shallow
+    if state.is_shallow {
+        println!("  🌱 Shallow: Truncated history clone");
+    }
+
+    // Large files
+    if !state.large_files.is_empty() {
+        println!("  ⚠️ Large Files: {} file(s) >5MB staged in index", state.large_files.len().to_string().yellow());
+    }
+
     println!("{}", "────────────────────────────────────────────".dimmed());
 }
 
