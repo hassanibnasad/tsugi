@@ -104,6 +104,16 @@ impl TsugiEngine {
 
     /// Layer 2 & 3: Produce a guardrail-verified plan for the current repository state and intent.
     pub fn plan(&self, state: &RepoState, user_intent: &str) -> Result<PlanOutcome, TsugiError> {
+        self.plan_with_history(state, user_intent, &[])
+    }
+
+    /// Layer 2 & 3: Produce a guardrail-verified plan using current state, intent, and conversational history.
+    pub fn plan_with_history(
+        &self,
+        state: &RepoState,
+        user_intent: &str,
+        session_history: &[crate::types::SessionTurn],
+    ) -> Result<PlanOutcome, TsugiError> {
         // Step 1: Try Tier-0 deterministic fast-path
         if let Some(t0_plan) = tier0::try_resolve(state, user_intent) {
             info!("Tier-0 fast-path matched — no LLM needed");
@@ -111,11 +121,11 @@ impl TsugiEngine {
             return Ok(PlanOutcome::Ready(guarded));
         }
 
-        // Step 2: Fall back to local inference backend
+        // Step 2: Fall back to local inference backend with conversation context
         match config::check_setup() {
             SetupStatus::Ready { .. } => {
                 info!("Invoking local LLM inference backend");
-                let raw_plan = self.inference.generate_plan(state, user_intent, &self.config)?;
+                let raw_plan = self.inference.generate_plan_with_history(state, user_intent, session_history, &self.config)?;
                 let guarded = guardrail::apply_guardrails(raw_plan, &self.config)?;
                 Ok(PlanOutcome::Ready(guarded))
             }

@@ -52,6 +52,17 @@ pub trait InferenceBackend: Send + Sync {
         user_intent: &str,
         config: &TsugiConfig,
     ) -> Result<ResolutionPlan, TsugiError>;
+
+    /// Generate a resolution plan given state, intent, and previous conversation turns.
+    fn generate_plan_with_history(
+        &self,
+        state: &RepoState,
+        user_intent: &str,
+        _history: &[crate::types::SessionTurn],
+        config: &TsugiConfig,
+    ) -> Result<ResolutionPlan, TsugiError> {
+        self.generate_plan(state, user_intent, config)
+    }
 }
 
 /// Production inference adapter wrapping local `llama-cli` and `llama-server`.
@@ -66,6 +77,16 @@ impl InferenceBackend for LlamaCliBackend {
         config: &TsugiConfig,
     ) -> Result<ResolutionPlan, TsugiError> {
         resolve_with_llm(state, user_intent, config)
+    }
+
+    fn generate_plan_with_history(
+        &self,
+        state: &RepoState,
+        user_intent: &str,
+        history: &[crate::types::SessionTurn],
+        config: &TsugiConfig,
+    ) -> Result<ResolutionPlan, TsugiError> {
+        resolve_with_llm_with_history(state, user_intent, history, config)
     }
 }
 
@@ -121,16 +142,19 @@ impl InferenceBackend for MockInferenceBackend {
 }
 
 /// Resolve a Git issue by invoking the local LLM with grammar-constrained generation.
-///
-/// This function:
-/// 1. Determines the model tier based on available system memory.
-/// 2. Constructs the prompt from the fact sheet + user intent.
-/// 3. Checks for an active local `llama-server` (127.0.0.1:8080) as a fast path.
-/// 4. Otherwise invokes `llama-cli` with GBNF grammar constraints.
-/// 5. Parses the structured JSON output into a `ResolutionPlan`.
 pub fn resolve_with_llm(
     state: &RepoState,
     user_intent: &str,
+    config: &TsugiConfig,
+) -> Result<ResolutionPlan, TsugiError> {
+    resolve_with_llm_with_history(state, user_intent, &[], config)
+}
+
+/// Resolve a Git issue with previous conversation turns included in context.
+pub fn resolve_with_llm_with_history(
+    state: &RepoState,
+    user_intent: &str,
+    session_history: &[crate::types::SessionTurn],
     config: &TsugiConfig,
 ) -> Result<ResolutionPlan, TsugiError> {
     // Step 1: Select model tier based on available memory
@@ -139,7 +163,7 @@ pub fn resolve_with_llm(
 
     // Step 2: Construct the prompt
     let fact_sheet = state.to_fact_sheet();
-    let prompt = build_prompt(&fact_sheet, user_intent);
+    let prompt = build_prompt_with_history(&fact_sheet, user_intent, session_history);
     debug!("Constructed prompt ({} chars)", prompt.len());
 
     let grammar_str = TSUGI_PLAN_GBNF;
@@ -240,7 +264,26 @@ fn select_model_tier(config: &TsugiConfig) -> ModelTier {
 ///
 /// The prompt is designed to be <250 tokens total, maximizing the signal-to-noise
 /// ratio for a 1.5B parameter model with a 1024-token context window.
-fn build_prompt(fact_sheet: &str, user_intent: &str) -> String {
+pub fn build_prompt(fact_sheet: &str, user_intent: &str) -> String {
+    build_prompt_with_history(fact_sheet, user_intent, &[])
+}
+
+fn build_prompt_with_history(
+    fact_sheet: &str,
+    user_intent: &str,
+    session_history: &[crate::types::SessionTurn],
+) -> String {
+    let mut history_str = String::new();
+    if !session_history.is_empty() {
+        history_str.push_str("\nPREVIOUS_TURNS:\n");
+        for turn in session_history.iter().rev().take(3).rev() {
+            history_str.push_str(&format!(
+                "- USER: {}\n  ASSISTANT: {}\n",
+                turn.user_prompt, turn.assistant_response
+            ));
+        }
+    }
+
     format!(
         r#"<|im_start|>system
 You are tsugi, an expert Git diagnostic and resolution engine. You receive a structured Git repository state and a user's description of their issue. You must output a JSON resolution plan.
@@ -254,10 +297,19 @@ Rules:
 6. Never use `git reset --hard` without a prior backup step.
 7. Prefer `git switch` over `git checkout` for branch operations.
 8. Always preserve uncommitted work — stash before destructive operations.
+
+Examples:
+Fact Sheet: [REPO_STATE] HEAD: ATTACHED to main, TRACKING: origin/main (ahead 1, behind 2)
+USER_INTENT: pull and push
+{{"root_cause":"Local branch diverged from upstream","risk_tier":"MUTATING_SAFE","execution_steps":[{{"cmd":"git pull --rebase origin main","explanation":"Rebase local commit onto upstream","requires_confirmation":false}},{{"cmd":"git push --force-with-lease origin main","explanation":"Push cleanly to remote","requires_confirmation":false}}],"rollback_cmd":"git rebase --abort"}}
+
+Fact Sheet: [REPO_STATE] HEAD: ATTACHED to feature, CONFLICTS: ["src/index.ts"]
+USER_INTENT: resolve rebase conflict
+{{"root_cause":"Active rebase conflict in src/index.ts","risk_tier":"MUTATING_SAFE","execution_steps":[{{"cmd":"git status","explanation":"Inspect conflicted files","requires_confirmation":false}},{{"cmd":"git rebase --continue","explanation":"Resume rebase after resolving files","requires_confirmation":false}}],"rollback_cmd":"git rebase --abort"}}
 <|im_end|>
 <|im_start|>user
 {fact_sheet}
-
+{history_str}
 USER_INTENT: {user_intent}
 <|im_end|>
 <|im_start|>assistant
@@ -454,6 +506,8 @@ struct LlmOutput {
 struct LlmStep {
     cmd: String,
     explanation: String,
+    #[serde(default)]
+    requires_confirmation: Option<bool>,
 }
 
 /// Parse the raw LLM output (JSON enforced by GBNF) into a `ResolutionPlan`.
@@ -478,7 +532,9 @@ fn parse_llm_output(raw: &str) -> Result<ResolutionPlan, TsugiError> {
         .execution_steps
         .into_iter()
         .map(|s| {
-            let requires_confirmation = matches!(risk_tier, RiskTier::MutatingDangerous | RiskTier::HistoryRewrite);
+            let requires_confirmation = s.requires_confirmation.unwrap_or_else(|| {
+                matches!(risk_tier, RiskTier::MutatingDangerous | RiskTier::HistoryRewrite)
+            });
             ExecutionStep {
                 cmd: s.cmd,
                 explanation: s.explanation,
@@ -561,8 +617,10 @@ root ::= "{" ws
 
 step ::= "{" ws
     "\"cmd\"" ws ":" ws string "," ws
-    "\"explanation\"" ws ":" ws string ws
+    "\"explanation\"" ws ":" ws string ("," ws "\"requires_confirmation\"" ws ":" ws boolean)? ws
     "}"
+
+boolean ::= "true" | "false"
 
 risk-tier ::= "\"READ_ONLY\"" | "\"MUTATING_SAFE\"" | "\"MUTATING_DANGEROUS\"" | "\"HISTORY_REWRITE\""
 
@@ -650,6 +708,13 @@ Done!"#;
             stash_count: 0,
             has_submodules: false,
             safe_rollback_ref: None,
+            worktrees: vec![],
+            remotes: vec![],
+            submodules: vec![],
+            is_shallow: false,
+            large_files: vec![],
+            installed_hooks: vec![],
+            graph_metrics: None,
         };
 
         let plan = backend.generate_plan(&state, "test", &config).unwrap();
