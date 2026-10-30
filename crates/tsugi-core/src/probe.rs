@@ -19,8 +19,9 @@ use git2::{
 use tracing::{debug, warn};
 
 use crate::types::{
-    ChangedFile, CommitEntry, ConflictEntry, ConflictHunk, ConflictType, FileDeltaStatus, HeadState,
-    OngoingOperation, ReflogEntry, RepoState, TrackingInfo, TsugiError, WorkingTreeSummary,
+    ChangedFile, CommitEntry, CommitGraphMetrics, ConflictEntry, ConflictHunk, ConflictType,
+    FileDeltaStatus, HeadState, HookInfo, LargeFileEntry, OngoingOperation, ReflogEntry, RemoteInfo,
+    RepoState, SubmoduleState, TrackingInfo, TsugiError, WorkingTreeSummary, WorktreeInfo,
 };
 
 /// Maximum number of recent commits to include in the fact sheet.
@@ -63,6 +64,13 @@ pub fn probe_repo_state(path: &Path) -> Result<RepoState, TsugiError> {
     let stash_count = probe_stash_count(&repo);
     let has_submodules = probe_submodules(&repo);
     let safe_rollback_ref = compute_safe_rollback(&repo, &ongoing_operation);
+    let worktrees = probe_worktrees(&repo);
+    let remotes = probe_remotes(&repo);
+    let submodules = probe_submodule_details(&repo);
+    let is_shallow = probe_is_shallow(&repo);
+    let large_files = probe_large_files_in_index(&repo, 5_000_000);
+    let installed_hooks = probe_installed_hooks(&repo);
+    let graph_metrics = probe_graph_metrics(&repo, &recent_commits);
 
     Ok(RepoState {
         repo_root,
@@ -76,6 +84,13 @@ pub fn probe_repo_state(path: &Path) -> Result<RepoState, TsugiError> {
         stash_count,
         has_submodules,
         safe_rollback_ref,
+        worktrees,
+        remotes,
+        submodules,
+        is_shallow,
+        large_files,
+        installed_hooks,
+        graph_metrics,
     })
 }
 
@@ -532,6 +547,143 @@ fn probe_stash_count(repo: &Repository) -> usize {
 
 fn probe_submodules(repo: &Repository) -> bool {
     repo.submodules().map(|s| !s.is_empty()).unwrap_or(false)
+}
+
+fn probe_worktrees(repo: &Repository) -> Vec<WorktreeInfo> {
+    let mut result = Vec::new();
+    if let Ok(worktrees) = repo.worktrees() {
+        for i in 0..worktrees.len() {
+            if let Ok(Some(name)) = worktrees.get(i) {
+                if let Ok(wt) = repo.find_worktree(name) {
+                    let is_locked = wt.is_locked().is_ok();
+                    let is_prunable = wt.is_prunable(None).unwrap_or(false);
+                    result.push(WorktreeInfo {
+                        name: name.to_string(),
+                        path: wt.path().to_path_buf(),
+                        is_locked,
+                        is_prunable,
+                        head_branch: None,
+                    });
+                }
+            }
+        }
+    }
+    result
+}
+
+fn probe_remotes(repo: &Repository) -> Vec<RemoteInfo> {
+    let mut result = Vec::new();
+    if let Ok(remotes) = repo.remotes() {
+        for i in 0..remotes.len() {
+            if let Ok(Some(name)) = remotes.get(i) {
+                if let Ok(remote) = repo.find_remote(name) {
+                    let fetch_url = remote.url().ok().map(|s| s.to_string());
+                    let push_url = remote.pushurl().ok().flatten().map(|s| s.to_string()).or_else(|| fetch_url.clone());
+                    result.push(RemoteInfo {
+                        name: name.to_string(),
+                        fetch_url,
+                        push_url,
+                    });
+                }
+            }
+        }
+    }
+    result
+}
+
+fn probe_submodule_details(repo: &Repository) -> Vec<SubmoduleState> {
+    let mut result = Vec::new();
+    if let Ok(submodules) = repo.submodules() {
+        for subm in submodules {
+            let name = subm.name().ok().unwrap_or_default().to_string();
+            let path = subm.path().to_string_lossy().to_string();
+            let url = subm.url().ok().flatten().map(|u| u.to_string());
+            let head_commit = subm.head_id().map(|id| id.to_string());
+            let is_initialized = subm.open().is_ok();
+            let is_dirty = repo
+                .submodule_status(&name, git2::SubmoduleIgnore::None)
+                .map(|s| !s.is_empty())
+                .unwrap_or(false);
+            result.push(SubmoduleState {
+                name,
+                path,
+                url,
+                head_commit,
+                is_initialized,
+                is_dirty,
+            });
+        }
+    }
+    result
+}
+
+fn probe_is_shallow(repo: &Repository) -> bool {
+    repo.is_shallow()
+}
+
+fn probe_large_files_in_index(repo: &Repository, max_bytes: usize) -> Vec<LargeFileEntry> {
+    let mut result = Vec::new();
+    if let Ok(index) = repo.index() {
+        for entry in index.iter() {
+            if (entry.file_size as usize) > max_bytes {
+                let path = String::from_utf8_lossy(&entry.path).to_string();
+                result.push(LargeFileEntry {
+                    path,
+                    size_bytes: entry.file_size as usize,
+                    is_lfs_tracked: false,
+                });
+            }
+        }
+    }
+    result
+}
+
+fn probe_installed_hooks(repo: &Repository) -> Vec<HookInfo> {
+    let mut result = Vec::new();
+    let hooks_dir = repo.path().join("hooks");
+    let hook_names = ["pre-commit", "commit-msg", "pre-push", "post-merge", "pre-rebase"];
+    for name in hook_names {
+        let hook_path = hooks_dir.join(name);
+        if hook_path.exists() && hook_path.is_file() {
+            result.push(HookInfo {
+                name: name.to_string(),
+                is_active: true,
+            });
+        }
+    }
+    result
+}
+
+fn probe_graph_metrics(repo: &Repository, recent_commits: &[CommitEntry]) -> Option<CommitGraphMetrics> {
+    let local_branch_count = repo.branches(Some(git2::BranchType::Local)).map(|b| b.count()).unwrap_or(0);
+    let remote_branch_count = repo.branches(Some(git2::BranchType::Remote)).map(|b| b.count()).unwrap_or(0);
+    let tag_count = repo.tag_names(None).map(|t| t.len()).unwrap_or(0);
+
+    let mut merge_count = 0;
+    let mut has_wip = false;
+    for c in recent_commits {
+        let lower = c.message_oneline.to_lowercase();
+        if lower.starts_with("merge ") {
+            merge_count += 1;
+        }
+        if lower.starts_with("wip") || lower.starts_with("fixup!") || lower.starts_with("squash!") || lower.contains("temp commit") {
+            has_wip = true;
+        }
+    }
+
+    let merge_commit_ratio = if !recent_commits.is_empty() {
+        merge_count as f32 / recent_commits.len() as f32
+    } else {
+        0.0
+    };
+
+    Some(CommitGraphMetrics {
+        local_branch_count,
+        remote_branch_count,
+        tag_count,
+        merge_commit_ratio,
+        has_wip_commits: has_wip,
+    })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
