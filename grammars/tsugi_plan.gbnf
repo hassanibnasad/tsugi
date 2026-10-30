@@ -9,8 +9,10 @@ root ::= "{" ws
 # A single execution step
 step ::= "{" ws
     "\"cmd\"" ws ":" ws string "," ws
-    "\"explanation\"" ws ":" ws string ws
+    "\"explanation\"" ws ":" ws string ("," ws "\"requires_confirmation\"" ws ":" ws boolean)? ws
     "}"
+
+boolean ::= "true" | "false"
 
 # Risk tier enum — exactly one of these four values
 risk-tier ::= "\"READ_ONLY\"" | "\"MUTATING_SAFE\"" | "\"MUTATING_DANGEROUS\"" | "\"HISTORY_REWRITE\""
