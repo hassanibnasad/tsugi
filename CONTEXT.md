@@ -35,3 +35,12 @@ The model execution seam separating resolution reasoning from the physical execu
 Adapters:
 - `LlamaCliAdapter`: Invokes the local `llama-cli` process with GBNF grammar constraints.
 - `MockInferenceAdapter`: Returns predetermined plans for offline, hermetic unit/integration tests without requiring model weights.
+
+### `ReplSession`
+The conversational co-pilot loop maintaining an in-memory rolling session context window (<2MB RAM) across iterative user turns, enabling interactive clarification and multi-step repair workflows.
+
+### `PrCheck`
+Deterministic pre-PR audit engine evaluating branch readiness: Conventional Commits compliance, WIP commit detection, secret leakage scanning, and linear history validation against upstream target bases.
+
+### `RecoveryArchaeology`
+Dangling object and reflog scanner locating unreferenced, reset, or orphaned commits without relying on cloud backups or external tooling.

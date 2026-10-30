@@ -24,12 +24,14 @@ Tsugi is an enterprise-grade terminal Git assistant that autonomously diagnoses 
        │
        ▼
 1. Deterministic Probe (libgit2 <10ms) ──► Produces compact RepoState fact sheet (~150 tokens)
+                                           with worktree, remote, submodule & graph topology
        │
        ▼
-2. Tier-0 Fast-Path (0.1ms) ─────────────► Deterministic pattern matching (no LLM required)
+2. Tier-0 Fast-Path (<2ms) ──────────────► 80+ deterministic patterns (no LLM required)
        │ (if unhandled)
        ▼
 3. Local SLM Inference (GBNF Grammar) ───► Strict JSON plan generation (Qwen2.5-Coder-1.5B)
+                                           with rolling multi-turn conversation memory
        │
        ▼
 4. Guardrail Policy & Safety Vault ──────► Validates commands, checks risk tier,
