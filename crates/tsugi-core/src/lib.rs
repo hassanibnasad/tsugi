@@ -32,6 +32,8 @@ pub mod formatter;
 pub mod coordinator;
 pub mod tier0_split;
 pub mod split_inference;
+pub mod explain;
+pub mod log_analysis;
 
 // Re-export primary deep types and seams
 pub use coordinator::{PlanOutcome, ResolutionOutcome, TsugiEngine};
