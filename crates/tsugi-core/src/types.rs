@@ -48,6 +48,96 @@ pub struct RepoState {
 
     /// Safe rollback target (if identifiable).
     pub safe_rollback_ref: Option<String>,
+
+    /// Active git worktrees.
+    #[serde(default)]
+    pub worktrees: Vec<WorktreeInfo>,
+
+    /// Configured remotes.
+    #[serde(default)]
+    pub remotes: Vec<RemoteInfo>,
+
+    /// Submodule states.
+    #[serde(default)]
+    pub submodules: Vec<SubmoduleState>,
+
+    /// Whether the repo is a shallow clone.
+    #[serde(default)]
+    pub is_shallow: bool,
+
+    /// Large files staged in the index (e.g. >5MB without LFS).
+    #[serde(default)]
+    pub large_files: Vec<LargeFileEntry>,
+
+    /// Installed hooks.
+    #[serde(default)]
+    pub installed_hooks: Vec<HookInfo>,
+
+    /// Graph metrics (branches, tags, merge commits).
+    #[serde(default)]
+    pub graph_metrics: Option<CommitGraphMetrics>,
+}
+
+/// Information about a linked git worktree.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorktreeInfo {
+    pub name: String,
+    pub path: PathBuf,
+    pub is_locked: bool,
+    pub is_prunable: bool,
+    pub head_branch: Option<String>,
+}
+
+/// Remote tracking configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RemoteInfo {
+    pub name: String,
+    pub fetch_url: Option<String>,
+    pub push_url: Option<String>,
+}
+
+/// Information about a git submodule.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SubmoduleState {
+    pub name: String,
+    pub path: String,
+    pub url: Option<String>,
+    pub head_commit: Option<String>,
+    pub is_initialized: bool,
+    pub is_dirty: bool,
+}
+
+/// Large file entry in index (>5MB or matching known large file patterns).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LargeFileEntry {
+    pub path: String,
+    pub size_bytes: usize,
+    pub is_lfs_tracked: bool,
+}
+
+/// Git hook information.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HookInfo {
+    pub name: String,
+    pub is_active: bool,
+}
+
+/// Graph metrics about the repository commit history.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CommitGraphMetrics {
+    pub local_branch_count: usize,
+    pub remote_branch_count: usize,
+    pub tag_count: usize,
+    pub merge_commit_ratio: f32,
+    pub has_wip_commits: bool,
+}
+
+/// A conversation turn in a REPL session.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionTurn {
+    pub user_prompt: String,
+    pub assistant_response: String,
+    pub executed: bool,
 }
 
 /// HEAD can be attached to a branch, detached at a commit, or unborn (empty repo).
@@ -571,6 +661,38 @@ impl RepoState {
 
         if let Some(ref rollback) = self.safe_rollback_ref {
             lines.push(format!("SAFE_ROLLBACK_TARGET: {rollback}"));
+        }
+
+        if self.is_shallow {
+            lines.push("SHALLOW_CLONE: true (history is truncated)".to_string());
+        }
+
+        if !self.remotes.is_empty() {
+            let remote_strs: Vec<String> = self.remotes.iter().map(|r| {
+                format!("{}:{}", r.name, r.fetch_url.as_deref().unwrap_or("none"))
+            }).collect();
+            lines.push(format!("REMOTES: [{}]", remote_strs.join(", ")));
+        }
+
+        if !self.submodules.is_empty() {
+            let uninit = self.submodules.iter().filter(|s| !s.is_initialized).count();
+            let dirty = self.submodules.iter().filter(|s| s.is_dirty).count();
+            lines.push(format!("SUBMODULES: {} total ({} uninitialized, {} dirty)", self.submodules.len(), uninit, dirty));
+        }
+
+        if self.worktrees.len() > 1 {
+            lines.push(format!("WORKTREES: {} active linked worktrees", self.worktrees.len()));
+        }
+
+        if !self.large_files.is_empty() {
+            let file_names: Vec<String> = self.large_files.iter().map(|f| format!("{} ({}MB)", f.path, f.size_bytes / 1_000_000)).collect();
+            lines.push(format!("LARGE_FILES_STAGED: [{}]", file_names.join(", ")));
+        }
+
+        if let Some(ref gm) = self.graph_metrics {
+            if gm.has_wip_commits {
+                lines.push("GRAPH_SIGNAL: WIP/fixup commits detected in recent history".to_string());
+            }
         }
 
         // Append recent commits (compact)
