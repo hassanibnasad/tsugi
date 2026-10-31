@@ -10,27 +10,131 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use colored::Colorize;
+use tracing::debug;
 use tsugi_core::{
     explain::explain_command,
     formatter,
-    types::{HeadState, SessionTurn},
+    types::{HeadState, SessionTurn, TsugiConfig},
     PlanOutcome, TerminalObserver, TsugiEngine,
 };
 
 const MAX_SESSION_TURNS: usize = 5;
 
+/// RAII Guard managing a local ephemeral llama-server process during REPL sessions.
+/// Automatically terminates the server process on drop, ensuring 0 MB idle RAM.
+pub struct EphemeralServerGuard {
+    child: Option<std::process::Child>,
+}
+
+impl EphemeralServerGuard {
+    pub fn spawn_if_needed(config: &TsugiConfig) -> Self {
+        // 1. Check if server already running on port 8089 or configured URL
+        if tsugi_core::config::is_llama_server_running(Some("http://127.0.0.1:8089")) {
+            debug!("llama-server already active on port 8089; reusing existing instance");
+            return Self { child: None };
+        }
+        if let Some(ref url) = config.llama_server_url {
+            if tsugi_core::config::is_llama_server_running(Some(url)) {
+                debug!("llama-server already active on configured endpoint {url}");
+                return Self { child: None };
+            }
+        }
+
+        // 2. Locate llama-server binary and model path
+        let server_bin = match tsugi_core::engine::find_llama_server() {
+            Ok(bin) => bin,
+            Err(_) => return Self { child: None },
+        };
+
+        let model_path = match config.primary_model_path.as_ref().or(config.fallback_model_path.as_ref()) {
+            Some(p) if p.exists() => p,
+            _ => return Self { child: None },
+        };
+
+        // 3. Spawn child process: llama-server -m <model_path> -c 2048 --port 8089 --timeout 300
+        let mut cmd = std::process::Command::new(server_bin);
+        cmd.arg("-m")
+            .arg(model_path)
+            .arg("-c")
+            .arg("2048")
+            .arg("--port")
+            .arg("8089")
+            .arg("--timeout")
+            .arg("300")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                debug!("Failed to spawn ephemeral llama-server: {e}");
+                return Self { child: None };
+            }
+        };
+
+        // 4. Poll for readiness up to 8 seconds (checking child.try_wait() on each tick)
+        let start = std::time::Instant::now();
+        let timeout = std::time::Duration::from_secs(8);
+        let mut ready = false;
+
+        while start.elapsed() < timeout {
+            // Check if child exited early / crashed
+            if let Ok(Some(status)) = child.try_wait() {
+                debug!("Ephemeral llama-server process exited early with status: {status}");
+                return Self { child: None };
+            }
+
+            if tsugi_core::config::is_llama_server_running(Some("http://127.0.0.1:8089")) {
+                ready = true;
+                break;
+            }
+
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+
+        if ready {
+            println!("  {} Warm inference server ready on port 8089 (<100ms response time)", "⚡".cyan());
+            Self { child: Some(child) }
+        } else {
+            // If port 8089 still hasn't bound after 8s, kill and wait to avoid leaking an orphaned process
+            let _ = child.kill();
+            let _ = child.wait();
+            Self { child: None }
+        }
+    }
+}
+
+impl Drop for EphemeralServerGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
 pub struct ReplSession {
     repo_path: PathBuf,
     engine: TsugiEngine,
     turns: VecDeque<SessionTurn>,
+    _managed_server: Option<EphemeralServerGuard>,
 }
 
 impl ReplSession {
     pub fn new(repo_path: PathBuf, engine: TsugiEngine) -> Self {
+        let server = EphemeralServerGuard::spawn_if_needed(engine.config());
         Self {
             repo_path,
             engine,
             turns: VecDeque::with_capacity(MAX_SESSION_TURNS),
+            _managed_server: Some(server),
         }
     }
 
@@ -65,8 +169,13 @@ impl ReplSession {
             io::stdout().flush().ok();
 
             let mut input = String::new();
-            if io::stdin().read_line(&mut input).is_err() {
-                break;
+            match io::stdin().read_line(&mut input) {
+                Ok(0) => {
+                    println!("\n  {} Session ended.", "👋".dimmed());
+                    break;
+                }
+                Err(_) => break,
+                Ok(_) => {}
             }
 
             let query = input.trim();
