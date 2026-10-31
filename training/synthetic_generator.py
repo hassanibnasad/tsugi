@@ -34,6 +34,11 @@ Rules:
 7. Prefer `git switch` over `git checkout` for branch operations.
 8. Always preserve uncommitted work — stash before destructive operations."""
 
+SPLIT_SYSTEM_PROMPT = """You are tsugi (次), an expert Git assistant. Your task is to inspect uncommitted changes and cluster them into atomic, cohesive Conventional Commits (feat, fix, docs, test, refactor, chore, style, perf, ci).
+Output strictly conforms to the JSON schema with summary and commits array."""
+
+EXPLAIN_SYSTEM_PROMPT = """You are tsugi, an expert Git diagnostic and explanation engine. Provide clear, accurate, and contextual explanations of Git commands and strategies."""
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Randomization Pools for Generalization
 # ─────────────────────────────────────────────────────────────────────────────
@@ -112,10 +117,13 @@ def format_repo_state(
     untracked_files: Optional[List[str]] = None,
     incoming_commits: Optional[List[str]] = None,
     conflict_previews: Optional[List[str]] = None,
+    branches: Optional[List[str]] = None,
 ) -> str:
     """Formats Symbolic State Fact Sheet in exact format expected by Rust runtime."""
     lines = ["[REPO_STATE]"]
     lines.append(f"HEAD: {head}")
+    if branches:
+        lines.append(f"BRANCHES: [{', '.join(f'\"{b}\"' for b in branches[:20])}]")
     lines.append(f"ONGOING_OP: {ongoing_op}")
 
     if not conflicts:
@@ -130,21 +138,22 @@ def format_repo_state(
         lines.append(f"CONFLICTS: [{', '.join(conflict_strs)}]")
 
         if conflict_previews:
+            lines.append("CONFLICT_HUNKS:")
             for prev in conflict_previews[:3]:
                 lines.append(prev)
 
     lines.append(f"STAGED: {staged} | UNSTAGED: {unstaged} | UNTRACKED: {untracked}")
 
     if staged_files:
-        quoted = [f'"{f}"' for f in staged_files[:15]]
+        quoted = [f'"{f}"' for f in staged_files[:20]]
         lines.append(f"STAGED_FILES: [{', '.join(quoted)}]")
 
     if unstaged_files:
-        quoted = [f'"{f}"' for f in unstaged_files[:15]]
+        quoted = [f'"{f}"' for f in unstaged_files[:20]]
         lines.append(f"UNSTAGED_FILES: [{', '.join(quoted)}]")
 
     if untracked_files:
-        quoted = [f'"{f}"' for f in untracked_files[:15]]
+        quoted = [f'"{f}"' for f in untracked_files[:20]]
         lines.append(f"UNTRACKED_FILES: [{', '.join(quoted)}]")
 
     if tracking:
@@ -172,6 +181,17 @@ def format_repo_state(
             lines.append(f"  {r}")
 
     return "\n".join(lines)
+
+
+def format_user_prompt(fact_sheet: str, intent: str, history: Optional[List[Tuple[str, str]]] = None) -> str:
+    """Byte-for-byte exact alignment with engine.rs build_prompt_with_history."""
+    history_str = ""
+    if history:
+        history_lines = ["\nPREVIOUS_TURNS:"]
+        for h_user, h_asst in history[-3:]:
+            history_lines.append(f"- USER: {h_user}\n  ASSISTANT: {h_asst}")
+        history_str = "\n".join(history_lines) + "\n"
+    return f"{fact_sheet}\n{history_str}USER_INTENT: {intent}"
 
 
 def normalize_plan(plan: Dict[str, Any]) -> Dict[str, Any]:
@@ -1320,56 +1340,386 @@ INCIDENT_GENERATORS = [
 ]
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Task B: Atomic Commit Splitting Generator (tsugi_split.gbnf schema)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def generate_split_task(rng: random.Random) -> Dict[str, Any]:
+    """Generates atomic commit splitting training examples conforming to tsugi_split.gbnf."""
+    num_commits = rng.randint(2, 3)
+    categories = [
+        ("feat", "auth", ["src/auth.ts", "src/services/payment.ts"], "feat(auth): implement authentication and token validation"),
+        ("docs", "readme", ["README.md", "docs/api.md"], "docs(readme): update API documentation and getting started guide"),
+        ("test", "core", ["tests/integration_test.rs", "tests/unit_test.rs"], "test(core): add unit and integration test coverage"),
+        ("chore", "deps", ["package.json", "Cargo.toml"], "chore(deps): bump dependencies and lockfiles"),
+        ("style", "ui", ["src/styles/theme.css", "src/components/Header.tsx"], "style(ui): adjust dark mode styling and theme variables"),
+        ("refactor", "storage", ["pkg/storage/s3.go", "internal/server/server.go"], "refactor(storage): modularize cloud storage client"),
+        ("ci", "actions", [".github/workflows/ci.yml", "Dockerfile"], "ci(actions): streamline build and containerization workflows"),
+    ]
+    chosen = rng.sample(categories, num_commits)
+    all_files = []
+    commits_json = []
+
+    for c_type, scope, files, msg in chosen:
+        commit_files = rng.sample(files, rng.randint(1, len(files)))
+        for f in commit_files:
+            status = rng.choice(["modified", "added", "deleted"])
+            adds = rng.randint(5, 50)
+            dels = rng.randint(0, 20)
+            all_files.append({
+                "path": f,
+                "status": status,
+                "additions": adds,
+                "deletions": dels,
+                "preview": f"// Changes in {f}\n+// Added functionality\n-// Legacy code"
+            })
+        commits_json.append({
+            "commit_type": c_type,
+            "scope": scope,
+            "message": msg,
+            "explanation": f"Cluster related {c_type} changes for {scope} subsystem.",
+            "files": commit_files
+        })
+
+    user_lines = ["Cluster these changed files into logical, atomic commits:\n"]
+    for f in all_files:
+        user_lines.append(f'- file: "{f["path"]}" ({f["status"]}, +{f["additions"]}, -{f["deletions"]})')
+        user_lines.append("  diff preview:")
+        for pl in f["preview"].split("\n")[:4]:
+            user_lines.append(f"    {pl}")
+
+    assistant_json = {
+        "summary": f"Split working tree changes into {len(commits_json)} logical Conventional Commits",
+        "commits": commits_json
+    }
+
+    return {
+        "messages": [
+            {"role": "system", "content": SPLIT_SYSTEM_PROMPT},
+            {"role": "user", "content": "\n".join(user_lines)},
+            {"role": "assistant", "content": json.dumps(assistant_json, indent=2)}
+        ]
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Task C: Contextual Command Explanations Generator (tsugi explain)
+# ─────────────────────────────────────────────────────────────────────────────
+
+EXPLAIN_CATALOG = [
+    (
+        "git rebase -i HEAD~3",
+        "Interactive rebase for the last 3 commits. Opens an editor allowing you to reorder, squash (combine), edit commit messages, or drop commits before pushing.",
+        "READ_ONLY",
+        "git rebase --abort"
+    ),
+    (
+        "git push --force-with-lease origin main",
+        "Safe force push to origin/main. Updates the remote branch only if the remote ref matches your local tracking ref, preventing accidental overwrite of teammate commits.",
+        "MUTATING_SAFE",
+        "git reflog / git reset"
+    ),
+    (
+        "git reset --soft HEAD~1",
+        "Soft reset moves HEAD back one commit while keeping all changes in the staging area (index), allowing you to amend or recombine commits.",
+        "MUTATING_SAFE",
+        "git commit -C ORIG_HEAD"
+    ),
+    (
+        "git reset --hard HEAD~1",
+        "Hard reset moves HEAD back one commit and discards all unstaged and staged working tree modifications. WARNING: uncommitted edits will be lost.",
+        "MUTATING_DANGEROUS",
+        "git reset --hard ORIG_HEAD"
+    ),
+    (
+        "git restore --staged src/auth.ts",
+        "Unstages changes in src/auth.ts from the Git index while keeping all your edits in the working tree.",
+        "MUTATING_SAFE",
+        "git add src/auth.ts"
+    ),
+    (
+        "git restore package.json",
+        "Discards working tree modifications in package.json, restoring it to match the current HEAD.",
+        "MUTATING_DANGEROUS",
+        "git checkout HEAD -- package.json"
+    ),
+    (
+        "git worktree add ../hotfix main",
+        "Creates a linked worktree at '../hotfix' with the 'main' branch checked out, allowing simultaneous work without switching branches or stashing.",
+        "MUTATING_SAFE",
+        "git worktree remove ../hotfix"
+    ),
+    (
+        "git clean -fd",
+        "Permanently deletes all untracked files and untracked directories from your working tree. Use with caution as this bypasses the trash.",
+        "MUTATING_DANGEROUS",
+        "None (permanently removed)"
+    ),
+    (
+        "git submodule update --init --recursive",
+        "Initializes, fetches, and checks out all registered submodules and nested submodules to the commit SHAs recorded by the parent project.",
+        "MUTATING_SAFE",
+        "git submodule deinit -f --all"
+    ),
+    (
+        "git cherry-pick 4a8b1c9",
+        "Applies the changes introduced by commit 4a8b1c9 onto your currently active branch as a new commit.",
+        "MUTATING_SAFE",
+        "git cherry-pick --abort"
+    ),
+    (
+        "git bisect start HEAD v1.2.0",
+        "Begins a binary search between bad commit HEAD and good commit v1.2.0 to locate the commit that introduced a regression.",
+        "READ_ONLY",
+        "git bisect reset"
+    ),
+    (
+        "git merge --squash feature/payments",
+        "Takes all commits from feature/payments and stages them as a single commit in your working tree without creating a merge commit.",
+        "MUTATING_SAFE",
+        "git reset --hard HEAD"
+    ),
+    (
+        "git fetch --prune origin",
+        "Fetches updates from origin and removes stale local tracking branches whose remote counterparts were deleted on the server.",
+        "MUTATING_SAFE",
+        "git fetch"
+    ),
+]
+
+def generate_explain_task(rng: random.Random) -> Dict[str, Any]:
+    """Generates command explanation training pairs."""
+    cmd, explanation, tier, rollback = rng.choice(EXPLAIN_CATALOG)
+    intents = [
+        f"Explain what this command does: {cmd}",
+        f"USER_INTENT: explain {cmd}",
+        f"What does `{cmd}` do and what is the risk?",
+        f"explain {cmd}",
+    ]
+    intent = rng.choice(intents)
+    answer = f"Command: `{cmd}`\nRisk Tier: {tier}\n\nExplanation:\n{explanation}\n\nRollback / Recovery: `{rollback}`"
+
+    return {
+        "messages": [
+            {"role": "system", "content": EXPLAIN_SYSTEM_PROMPT},
+            {"role": "user", "content": intent},
+            {"role": "assistant", "content": answer}
+        ]
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Task D: File-Specific Operations (STAGED_FILES, UNSTAGED_FILES, CONFLICT_HUNKS)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def generate_file_specific_task(rng: random.Random) -> Dict[str, Any]:
+    """Generates file-specific Git resolution operations using repository state visibility."""
+    branch = random_branch(rng)
+    sha = random_sha(rng)
+    staged_sample = rng.sample(FILES, rng.randint(2, 4))
+    unstaged_sample = rng.sample([f for f in FILES if f not in staged_sample], rng.randint(2, 3))
+    untracked_sample = rng.sample(SECRET_FILES + ["notes.txt", "scratch.rs"], rng.randint(1, 2))
+
+    staged_files = [f"M {f}" for f in staged_sample]
+    unstaged_files = [f"M {f}" for f in unstaged_sample]
+
+    op_type = rng.choice(["unstage_specific", "restore_unstaged", "stage_specific", "conflict_ours_theirs"])
+
+    if op_type == "unstage_specific":
+        target = staged_sample[0]
+        intent = f"Unstage {target} but keep other files staged"
+        plan = {
+            "root_cause": f"User requested selective unstaging of {target} while preserving remainder of staged index.",
+            "risk_tier": "MUTATING_SAFE",
+            "execution_steps": [
+                {
+                    "cmd": f"git restore --staged {target}",
+                    "explanation": f"Remove {target} from the index staging area while preserving working tree edits.",
+                    "requires_confirmation": False
+                }
+            ],
+            "rollback_cmd": f"git add {target}",
+            "confidence": 0.98
+        }
+        fact_sheet = format_repo_state(
+            head=f"ATTACHED to {branch} ({sha})",
+            staged=f"+0 ~{len(staged_files)} -0 R0",
+            unstaged=f"~{len(unstaged_files)} -0",
+            untracked=len(untracked_sample),
+            staged_files=staged_files,
+            unstaged_files=unstaged_files,
+            untracked_files=untracked_sample,
+            branches=[branch, "main", f"origin/{branch}"]
+        )
+
+    elif op_type == "restore_unstaged":
+        target = unstaged_sample[0]
+        intent = f"Discard unstaged edits to {target}"
+        plan = {
+            "root_cause": f"User requested discarding working tree modifications for file {target}.",
+            "risk_tier": "MUTATING_DANGEROUS",
+            "execution_steps": [
+                {
+                    "cmd": f"git restore {target}",
+                    "explanation": f"Permanently discard uncommitted modifications in {target}.",
+                    "requires_confirmation": True
+                }
+            ],
+            "rollback_cmd": "git status",
+            "confidence": 0.96
+        }
+        fact_sheet = format_repo_state(
+            head=f"ATTACHED to {branch} ({sha})",
+            staged=f"+0 ~{len(staged_files)} -0 R0",
+            unstaged=f"~{len(unstaged_files)} -0",
+            untracked=len(untracked_sample),
+            staged_files=staged_files,
+            unstaged_files=unstaged_files,
+            untracked_files=untracked_sample,
+            branches=[branch, "main", f"origin/{branch}"]
+        )
+
+    elif op_type == "stage_specific":
+        target = unstaged_sample[0]
+        intent = f"Stage only {target}"
+        plan = {
+            "root_cause": f"User requested adding {target} to the staging area.",
+            "risk_tier": "MUTATING_SAFE",
+            "execution_steps": [
+                {
+                    "cmd": f"git add {target}",
+                    "explanation": f"Add {target} to index staging area.",
+                    "requires_confirmation": False
+                }
+            ],
+            "rollback_cmd": f"git restore --staged {target}",
+            "confidence": 0.99
+        }
+        fact_sheet = format_repo_state(
+            head=f"ATTACHED to {branch} ({sha})",
+            staged=f"+0 ~{len(staged_files)} -0 R0",
+            unstaged=f"~{len(unstaged_files)} -0",
+            untracked=len(untracked_sample),
+            staged_files=staged_files,
+            unstaged_files=unstaged_files,
+            untracked_files=untracked_sample,
+            branches=[branch, "main", f"origin/{branch}"]
+        )
+
+    else:  # conflict_ours_theirs
+        conf_file = "src/auth.ts"
+        choose_ours = rng.choice([True, False])
+        side = "ours" if choose_ours else "theirs"
+        intent = f"In {conf_file} resolve the conflict by keeping {side} version"
+        plan = {
+            "root_cause": f"Active merge conflict in {conf_file}. User resolved conflict in favor of --{side}.",
+            "risk_tier": "MUTATING_SAFE",
+            "execution_steps": [
+                {
+                    "cmd": f"git checkout --{side} {conf_file}",
+                    "explanation": f"Check out the {side} version of {conf_file} to resolve conflict markers.",
+                    "requires_confirmation": False
+                },
+                {
+                    "cmd": f"git add {conf_file}",
+                    "explanation": f"Stage {conf_file} to mark conflict as resolved.",
+                    "requires_confirmation": False
+                }
+            ],
+            "rollback_cmd": f"git checkout --merge {conf_file}",
+            "confidence": 0.98
+        }
+        hunk_preview = [
+            f'CONFLICT_PREVIEW for "{conf_file}" (ours<HEAD> vs theirs<origin/main>):',
+            "  <<<<<<< HEAD",
+            "  const API_KEY = process.env.API_KEY;",
+            "  =======",
+            "  const API_KEY = getSecretKey();",
+            "  >>>>>>> origin/main"
+        ]
+        fact_sheet = format_repo_state(
+            head=f"ATTACHED to {branch} ({sha})",
+            ongoing_op="MERGE in progress (merging abc1234)",
+            conflicts=[f'"{conf_file}" (both_modified)'],
+            staged="+0 ~0 -0 R0",
+            unstaged="~1 -0",
+            untracked=0,
+            conflict_previews=hunk_preview,
+            branches=[branch, "main", "origin/main"]
+        )
+
+    user_content = format_user_prompt(fact_sheet, intent)
+    return {
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_content},
+            {"role": "assistant", "content": json.dumps(plan, indent=2)}
+        ]
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Dataset Generation Entry Point
+# ─────────────────────────────────────────────────────────────────────────────
+
 def build_chatml_dataset(output_file: Path, total_examples: int = 5000, seed: int = 42) -> None:
-    """Generate high-diversity, schema-aligned ChatML training dataset."""
+    """Generate high-diversity, multi-task schema-aligned ChatML training dataset."""
     rng = random.Random(seed)
     dataset = []
     seen_prompts = set()
 
-    for i in range(total_examples):
-        generator = rng.choice(INCIDENT_GENERATORS)
-        gen_res = generator(rng)
-        if len(gen_res) == 4:
-            fact_sheet, intent, raw_plan, history = gen_res
+    # Target multi-task distribution:
+    # Task A (Single & multi-turn resolution plans): ~40%
+    # Task B (Atomic commit splitting plans): ~20%
+    # Task C (Command explanations): ~15%
+    # Task D (File-specific operations): ~25%
+
+    for _ in range(total_examples * 2):
+        if len(dataset) >= total_examples:
+            break
+
+        roll = rng.random()
+        if roll < 0.40:
+            generator = rng.choice(INCIDENT_GENERATORS)
+            gen_res = generator(rng)
+            if len(gen_res) == 4:
+                fact_sheet, intent, raw_plan, history = gen_res
+            else:
+                fact_sheet, intent, raw_plan = gen_res
+                history = []
+            plan = normalize_plan(raw_plan)
+            user_content = format_user_prompt(fact_sheet, intent, history)
+            assistant_content = json.dumps(plan, indent=2)
+            entry = {
+                "id": f"tsugi-train-{len(dataset):05d}",
+                "messages": [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": user_content},
+                    {"role": "assistant", "content": assistant_content}
+                ]
+            }
+        elif roll < 0.60:
+            entry = generate_split_task(rng)
+            entry["id"] = f"tsugi-train-{len(dataset):05d}"
+        elif roll < 0.75:
+            entry = generate_explain_task(rng)
+            entry["id"] = f"tsugi-train-{len(dataset):05d}"
         else:
-            fact_sheet, intent, raw_plan = gen_res
-            history = []
+            entry = generate_file_specific_task(rng)
+            entry["id"] = f"tsugi-train-{len(dataset):05d}"
 
-        plan = normalize_plan(raw_plan)
-
-        if history:
-            history_lines = ["\nPREVIOUS_TURNS:"]
-            for h_user, h_asst in history[-3:]:
-                history_lines.append(f"- USER: {h_user}\n  ASSISTANT: {h_asst}")
-            history_str = "\n".join(history_lines) + "\n\n"
-        else:
-            history_str = "\n\n"
-
-        user_content = f"{fact_sheet}{history_str}USER_INTENT: {intent}"
-        assistant_content = json.dumps(plan, indent=2)
-
-        prompt_key = (fact_sheet, intent)
+        prompt_key = entry["messages"][1]["content"]
         if prompt_key in seen_prompts:
-            # Re-generate with fresh jitter to maintain uniqueness
             continue
         seen_prompts.add(prompt_key)
-
-        chatml_entry = {
-            "id": f"tsugi-train-{len(dataset):05d}",
-            "messages": [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": user_content},
-                {"role": "assistant", "content": assistant_content}
-            ]
-        }
-        dataset.append(chatml_entry)
+        dataset.append(entry)
 
     output_file.parent.mkdir(parents=True, exist_ok=True)
     with open(output_file, "w", encoding="utf-8") as f:
         for entry in dataset:
             f.write(json.dumps(entry) + "\n")
 
-    print(f"Generated {len(dataset)} unique training examples -> {output_file}")
+    print(f"Generated {len(dataset)} multi-task training examples -> {output_file}")
 
 
 if __name__ == "__main__":
