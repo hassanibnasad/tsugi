@@ -1,15 +1,10 @@
-//! # Layer 2: Tier-0 Deterministic Fast-Path Engine
+//! # Layer 2: Tier-0 Deterministic Offline Fallback Engine
 //!
-//! Pattern-matches 80+ canonical Git scenarios against the [`RepoState`]
-//! and produces a [`ResolutionPlan`] without invoking the LLM. Resolves in <2ms
-//! using 0 bytes of LLM RAM.
-//!
-//! ## Design Philosophy
-//!
-//! Enterprise Git workflows follow structured patterns: diverged branches,
-//! interrupted rebases, unmerged conflicts, submodules, worktrees, stashes,
-//! tags, and remote tracking. For all unambiguous scenarios, a deterministic
-//! engine produces zero-latency, 100% reliable plans without GPU/CPU overhead.
+//! Provides an offline heuristic fallback and bare-status diagnostic for 80+ canonical Git scenarios.
+//! In an LLM-First architecture, natural language intents and REPL sessions are routed to the local
+//! LLM when ready. Tier-0 serves as an offline resilience layer when local inference is not yet set up
+//! or when evaluating zero-intent repository status checks.
+//! Resolves in <2ms using 0 bytes of LLM RAM.
 
 use crate::types::{
     ExecutionStep, HeadState, OngoingOperation, PlanSource, RepoState,
@@ -934,6 +929,7 @@ mod tests {
             installed_hooks: Vec::new(),
             graph_metrics: None,
             incoming_commits: Vec::new(),
+            branches: Vec::new(),
         }
     }
 

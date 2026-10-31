@@ -45,6 +45,9 @@ use crate::types::{
 /// Implementations adapt physical inference vehicles (local llama-cli subprocess,
 /// local HTTP llama-server, in-process FFI, or in-memory fakes) behind a common interface.
 pub trait InferenceBackend: Send + Sync {
+    /// Check whether this inference backend is ready to produce plans.
+    fn is_ready(&self, config: &TsugiConfig) -> bool;
+
     /// Generate a resolution plan given the fact sheet and user intent.
     fn generate_plan(
         &self,
@@ -70,6 +73,12 @@ pub trait InferenceBackend: Send + Sync {
 pub struct LlamaCliBackend;
 
 impl InferenceBackend for LlamaCliBackend {
+    fn is_ready(&self, config: &TsugiConfig) -> bool {
+        crate::config::is_llama_server_running(Some("http://127.0.0.1:8089"))
+            || crate::config::is_llama_server_running(config.llama_server_url.as_deref())
+            || matches!(crate::config::check_setup(), crate::config::SetupStatus::Ready { .. })
+    }
+
     fn generate_plan(
         &self,
         state: &RepoState,
@@ -99,6 +108,7 @@ pub fn default_backend() -> Box<dyn InferenceBackend> {
 #[derive(Debug, Clone)]
 pub struct MockInferenceBackend {
     canned_plan: Option<ResolutionPlan>,
+    ready: bool,
 }
 
 impl MockInferenceBackend {
@@ -106,7 +116,14 @@ impl MockInferenceBackend {
     pub fn new(canned_plan: ResolutionPlan) -> Self {
         Self {
             canned_plan: Some(canned_plan),
+            ready: true,
         }
+    }
+
+    /// Configure whether the mock backend reports ready.
+    pub fn with_ready(mut self, ready: bool) -> Self {
+        self.ready = ready;
+        self
     }
 
     /// Create a mock backend with a default safe testing plan.
@@ -124,11 +141,16 @@ impl MockInferenceBackend {
                 source: PlanSource::LlmPrimary,
                 confidence: 1.0,
             }),
+            ready: true,
         }
     }
 }
 
 impl InferenceBackend for MockInferenceBackend {
+    fn is_ready(&self, _config: &TsugiConfig) -> bool {
+        self.ready
+    }
+
     fn generate_plan(
         &self,
         _state: &RepoState,
@@ -169,8 +191,16 @@ pub fn resolve_with_llm_with_history(
     let grammar_str = TSUGI_PLAN_GBNF;
 
     // Step 3: Check for local llama-server HTTP fallback (127.0.0.1) first
+    let server_url = config.llama_server_url.as_deref().or_else(|| {
+        if crate::config::is_llama_server_running(Some("http://127.0.0.1:8089")) {
+            Some("http://127.0.0.1:8089")
+        } else {
+            None
+        }
+    });
+
     let raw_output = if let Some(server_resp) = try_query_llama_server(
-        config.llama_server_url.as_deref(),
+        server_url,
         &prompt,
         Some(grammar_str),
         config.max_generation_tokens,
@@ -371,6 +401,59 @@ pub fn find_llama_cli() -> Result<PathBuf, TsugiError> {
 
     Err(TsugiError::ConfigError(
         "llama-cli not found. Install llama.cpp or run `tsugi setup` for guided installation.".into(),
+    ))
+}
+
+/// Find the `llama-server` binary on the system PATH or in common install locations.
+pub fn find_llama_server() -> Result<PathBuf, TsugiError> {
+    // Check PATH first
+    if let Ok(output) = Command::new("llama-server").arg("--version").output() {
+        if output.status.success() {
+            return Ok(PathBuf::from("llama-server"));
+        }
+    }
+
+    // Check common install locations
+    let mut candidates = vec![
+        dirs::home_dir().map(|h| h.join(".tsugi").join("bin").join("llama-server.exe")),
+        dirs::home_dir().map(|h| h.join(".tsugi").join("llama-server.exe")),
+        dirs::home_dir().map(|h| h.join(".tsugi").join("bin").join("llama-server")),
+        dirs::home_dir().map(|h| h.join(".local").join("bin").join("llama-server")),
+        dirs::home_dir().map(|h| h.join("llama.cpp").join("build").join("bin").join("llama-server")),
+        Some(PathBuf::from("/usr/local/bin/llama-server")),
+        // Windows paths
+        dirs::home_dir().map(|h| h.join("llama.cpp").join("build").join("bin").join("Release").join("llama-server.exe")),
+        dirs::data_local_dir().map(|d| d.join("Microsoft").join("WinGet").join("Links").join("llama-server.exe")),
+        dirs::data_local_dir().map(|d| d.join("Programs").join("llama.cpp").join("llama-server.exe")),
+        Some(PathBuf::from("C:\\Program Files\\llama.cpp\\llama-server.exe")),
+    ];
+
+    // Check WinGet Packages directory on Windows
+    if let Some(local_app_data) = dirs::data_local_dir() {
+        let winget_packages = local_app_data.join("Microsoft").join("WinGet").join("Packages");
+        if winget_packages.exists() {
+            if let Ok(entries) = std::fs::read_dir(&winget_packages) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir() && path.file_name().map(|n| n.to_string_lossy().contains("llamacpp")).unwrap_or(false) {
+                        let direct_exe = path.join("llama-server.exe");
+                        if direct_exe.exists() {
+                            candidates.push(Some(direct_exe));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    for candidate in candidates.into_iter().flatten() {
+        if candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+
+    Err(TsugiError::ConfigError(
+        "llama-server not found. Install llama.cpp or ensure llama-server is on PATH.".into(),
     ))
 }
 
@@ -722,6 +805,7 @@ Done!"#;
             installed_hooks: vec![],
             graph_metrics: None,
             incoming_commits: vec![],
+            branches: vec![],
         };
 
         let plan = backend.generate_plan(&state, "test", &config).unwrap();

@@ -24,7 +24,6 @@ use std::path::Path;
 
 use tracing::info;
 
-use crate::config::{self, SetupStatus};
 use crate::engine::{default_backend, InferenceBackend};
 use crate::executor::{execute_plan_with_observer, ExecutionObserver};
 use crate::guardrail;
@@ -114,25 +113,57 @@ impl TsugiEngine {
         user_intent: &str,
         session_history: &[crate::types::SessionTurn],
     ) -> Result<PlanOutcome, TsugiError> {
-        // Step 1: Try Tier-0 deterministic fast-path (only on first turn without conversation context)
-        if session_history.is_empty() {
-            if let Some(t0_plan) = tier0::try_resolve(state, user_intent) {
-                info!("Tier-0 fast-path matched — no LLM needed");
-                let guarded = guardrail::apply_guardrails(t0_plan, &self.config)?;
-                return Ok(PlanOutcome::Ready(guarded));
+        let has_intent = !user_intent.trim().is_empty() || !session_history.is_empty();
+        let is_ready = self.inference.is_ready(&self.config);
+
+        // Path A: Natural language intent or conversational REPL session with ready LLM
+        if has_intent && is_ready {
+            info!("Invoking local LLM inference backend (primary brain)");
+            match self.inference.generate_plan_with_history(state, user_intent, session_history, &self.config) {
+                Ok(raw_plan) => {
+                    let guarded = guardrail::apply_guardrails(raw_plan, &self.config)?;
+                    return Ok(PlanOutcome::Ready(guarded));
+                }
+                Err(e) => {
+                    tracing::warn!("Local LLM inference encountered error ({e}); attempting Tier-0 offline fallback");
+                    if let Some(t0_plan) = tier0::try_resolve(state, user_intent) {
+                        let guarded = guardrail::apply_guardrails(t0_plan, &self.config)?;
+                        return Ok(PlanOutcome::Ready(guarded));
+                    }
+                    return Err(e);
+                }
             }
         }
 
-        // Step 2: Fall back to local inference backend with conversation context
-        match config::check_setup() {
-            SetupStatus::Ready { .. } => {
-                info!("Invoking local LLM inference backend");
-                let raw_plan = self.inference.generate_plan_with_history(state, user_intent, session_history, &self.config)?;
-                let guarded = guardrail::apply_guardrails(raw_plan, &self.config)?;
-                Ok(PlanOutcome::Ready(guarded))
+        // Path B: Natural language intent or REPL session when LLM is NOT set up -> Tier-0 offline fallback
+        if has_intent && !is_ready {
+            info!("Local LLM not ready — using Tier-0 deterministic offline fallback");
+            if let Some(t0_plan) = tier0::try_resolve(state, user_intent) {
+                let guarded = guardrail::apply_guardrails(t0_plan, &self.config)?;
+                return Ok(PlanOutcome::Ready(guarded));
             }
-            _ => Ok(PlanOutcome::SetupNeeded),
+            return Ok(PlanOutcome::SetupNeeded);
         }
+
+        // Path C: Bare, zero-intent status check -> Tier-0 fast status diagnostic
+        if let Some(t0_plan) = tier0::try_resolve(state, user_intent) {
+            info!("Tier-0 fast-path matched zero-intent diagnosis");
+            let guarded = guardrail::apply_guardrails(t0_plan, &self.config)?;
+            return Ok(PlanOutcome::Ready(guarded));
+        }
+
+        // If zero-intent has no Tier-0 rule match, consult LLM if ready or signal SetupNeeded
+        if is_ready {
+            match self.inference.generate_plan_with_history(state, user_intent, session_history, &self.config) {
+                Ok(raw_plan) => {
+                    let guarded = guardrail::apply_guardrails(raw_plan, &self.config)?;
+                    return Ok(PlanOutcome::Ready(guarded));
+                }
+                Err(_) => return Ok(PlanOutcome::SetupNeeded),
+            }
+        }
+
+        Ok(PlanOutcome::SetupNeeded)
     }
 
     /// Layer 4: Execute a resolution plan with shadow snapshotting and audit logging.
@@ -393,7 +424,8 @@ mod tests {
 
         let db_path = tmp.path().join("ledger.sqlite");
         let vault = SafetyVault::open(&db_path).unwrap();
-        let inference = Box::new(MockInferenceBackend::with_default_test_plan());
+        // Model is offline/not ready -> tier0 offline fallback
+        let inference = Box::new(MockInferenceBackend::with_default_test_plan().with_ready(false));
         let config = TsugiConfig::default();
 
         let engine = TsugiEngine::with_components(config, vault, inference);
@@ -402,11 +434,12 @@ mod tests {
         let state = engine.probe(tmp.path()).unwrap();
         assert!(matches!(state.head, crate::types::HeadState::Attached { .. }));
 
-        // Plan fix using Tier-0 pattern matching (unstage intent)
+        // Plan fix using Tier-0 pattern matching (unstage intent as offline fallback)
         let plan_outcome = engine.plan(&state, "unstage").unwrap();
         assert!(matches!(plan_outcome, PlanOutcome::Ready(_)));
 
         if let PlanOutcome::Ready(plan) = plan_outcome {
+            assert_eq!(plan.source, crate::types::PlanSource::Tier0);
             let observer = CapturingObserver::new(true);
             let executed = engine.execute(tmp.path(), &plan, "unstage", &observer).unwrap();
             assert!(!executed.is_empty());
@@ -414,6 +447,39 @@ mod tests {
             let history = engine.history(Some(&tmp.path().to_string_lossy()), 10).unwrap();
             assert_eq!(history.len(), 1);
             assert_eq!(history[0].user_intent, "unstage");
+        }
+    }
+
+    #[test]
+    fn test_tsugi_engine_llm_primary_when_ready() {
+        let tmp = TempDir::new().unwrap();
+        let repo = git2::Repository::init(tmp.path()).unwrap();
+
+        let test_file = tmp.path().join("file.txt");
+        std::fs::write(&test_file, "initial").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("file.txt")).unwrap();
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let sig = git2::Signature::now("Test", "test@example.com").unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "Initial commit", &tree, &[]).unwrap();
+
+        let db_path = tmp.path().join("ledger.sqlite");
+        let vault = SafetyVault::open(&db_path).unwrap();
+        // Backend is ready -> MUST route directly to LLM primary brain
+        let inference = Box::new(MockInferenceBackend::with_default_test_plan().with_ready(true));
+        let config = TsugiConfig::default();
+
+        let engine = TsugiEngine::with_components(config, vault, inference);
+        let state = engine.probe(tmp.path()).unwrap();
+
+        // Even for a canonical Tier-0 intent like "unstage", LLM is primary brain
+        let plan_outcome = engine.plan(&state, "unstage").unwrap();
+        assert!(matches!(plan_outcome, PlanOutcome::Ready(_)));
+        if let PlanOutcome::Ready(plan) = plan_outcome {
+            assert_eq!(plan.source, crate::types::PlanSource::LlmPrimary);
+            assert_eq!(plan.root_cause, "Mock resolution");
         }
     }
 
