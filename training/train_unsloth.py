@@ -403,14 +403,14 @@ def reward_state_context_alignment(prompts, completions, **kwargs) -> List[float
 # Training Pipeline
 # ─────────────────────────────────────────────────────────────────────────────
 
-def train_sft(model, tokenizer, dataset, output_dir: Path, max_steps: int = 150):
-    """Run Supervised Fine-Tuning stage."""
+def train_sft(model, tokenizer, dataset, output_dir: Path, epochs: int = 2):
+    """Run Supervised Fine-Tuning stage with packing enabled across full dataset epochs."""
     from trl import SFTTrainer
     from transformers import TrainingArguments
     from unsloth import FastLanguageModel
 
     print(f"\n{'='*60}")
-    print(f"[*] STAGE 1: Supervised Fine-Tuning (SFT) — {max_steps} steps")
+    print(f"[*] STAGE 1: Supervised Fine-Tuning (SFT) — {epochs} full epochs (packing=True)")
     print(f"{'='*60}\n")
 
     def formatting_prompts_func(examples):
@@ -429,7 +429,7 @@ def train_sft(model, tokenizer, dataset, output_dir: Path, max_steps: int = 150)
         per_device_train_batch_size=2,
         gradient_accumulation_steps=4,
         warmup_steps=10,
-        max_steps=max_steps,
+        num_train_epochs=epochs,
         learning_rate=2e-4,
         fp16=not bf16_available,
         bf16=bf16_available,
@@ -450,7 +450,7 @@ def train_sft(model, tokenizer, dataset, output_dir: Path, max_steps: int = 150)
             dataset_text_field="text",
             max_seq_length=2048,
             dataset_num_proc=2,
-            packing=False,
+            packing=True,
             args=trainer_args,
         )
     except TypeError:
@@ -461,7 +461,7 @@ def train_sft(model, tokenizer, dataset, output_dir: Path, max_steps: int = 150)
             dataset_text_field="text",
             max_seq_length=2048,
             dataset_num_proc=2,
-            packing=False,
+            packing=True,
             args=trainer_args,
         )
 
@@ -471,7 +471,7 @@ def train_sft(model, tokenizer, dataset, output_dir: Path, max_steps: int = 150)
     return trainer
 
 
-def train_grpo(model, tokenizer, dataset, output_dir: Path, max_steps: int = 60):
+def train_grpo(model, tokenizer, dataset, output_dir: Path, max_steps: int = 300):
     """Run Group Relative Policy Optimization (GRPO) stage with safety reward functions."""
     try:
         from trl import GRPOConfig, GRPOTrainer
@@ -486,6 +486,15 @@ def train_grpo(model, tokenizer, dataset, output_dir: Path, max_steps: int = 60)
     print(f"[*] STAGE 2: Policy Alignment via GRPO — {max_steps} steps")
     print(f"{'='*60}\n")
 
+    # Filter dataset for GRPO to resolution plan instances (Tasks A & D) where safety rewards apply
+    def is_resolution_plan_example(example):
+        msgs = example["messages"]
+        sys_msg = next((m["content"] for m in msgs if m["role"] == "system"), "")
+        return "expert Git diagnostic and resolution engine" in sys_msg
+
+    grpo_filtered = dataset.filter(is_resolution_plan_example)
+    print(f"[*] Filtered {len(grpo_filtered)} resolution plan instances for GRPO safety alignment")
+
     # Format dataset for GRPO: prompt contains system + user message
     def grpo_formatting_func(examples):
         prompts = []
@@ -498,7 +507,7 @@ def train_grpo(model, tokenizer, dataset, output_dir: Path, max_steps: int = 60)
             prompts.append(prompt_text)
         return {"prompt": prompts}
 
-    grpo_dataset = dataset.map(grpo_formatting_func, batched=True)
+    grpo_dataset = grpo_filtered.map(grpo_formatting_func, batched=True)
 
     bf16_available = is_bf16_supported()
 
@@ -559,15 +568,15 @@ def main():
         help="Training mode: 'sft' (supervised), 'grpo' (reinforcement), or 'all' (sft + grpo)",
     )
     parser.add_argument(
-        "--sft-steps",
+        "--sft-epochs",
         type=int,
-        default=150,
-        help="Maximum training steps for SFT stage",
+        default=2,
+        help="Number of full training epochs for SFT stage",
     )
     parser.add_argument(
         "--grpo-steps",
         type=int,
-        default=60,
+        default=300,
         help="Maximum training steps for GRPO stage",
     )
     parser.add_argument(
@@ -649,7 +658,7 @@ def main():
     # 5. Training Execution
     if args.mode in ["sft", "all"]:
         sft_output = checkpoints_dir / "sft"
-        train_sft(model, tokenizer, dataset, sft_output, max_steps=args.sft_steps)
+        train_sft(model, tokenizer, dataset, sft_output, epochs=args.sft_epochs)
 
     if args.mode in ["grpo", "all"]:
         grpo_output = checkpoints_dir / "grpo"
