@@ -72,6 +72,7 @@ pub fn probe_repo_state(path: &Path) -> Result<RepoState, TsugiError> {
     let large_files = probe_large_files_in_index(&repo, 5_000_000);
     let installed_hooks = probe_installed_hooks(&repo);
     let graph_metrics = probe_graph_metrics(&repo, &recent_commits);
+    let branches = probe_branches(&repo);
 
     Ok(RepoState {
         repo_root,
@@ -93,6 +94,7 @@ pub fn probe_repo_state(path: &Path) -> Result<RepoState, TsugiError> {
         installed_hooks,
         graph_metrics,
         incoming_commits,
+        branches,
     })
 }
 
@@ -128,6 +130,19 @@ fn probe_head(repo: &Repository) -> Result<HeadState, TsugiError> {
         }
         Err(e) => Err(TsugiError::Git(e)),
     }
+}
+
+/// Enumerate local and remote branch names.
+fn probe_branches(repo: &Repository) -> Vec<String> {
+    let mut branches = Vec::new();
+    if let Ok(branch_iter) = repo.branches(None) {
+        for branch in branch_iter.flatten() {
+            if let Ok(Some(name)) = branch.0.name() {
+                branches.push(name.to_string());
+            }
+        }
+    }
+    branches
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -270,7 +285,7 @@ fn probe_conflicts(repo: &Repository) -> Vec<ConflictEntry> {
         .collect()
 }
 
-/// Helper to parse the first conflict block (max 20 lines) from a conflicting file.
+/// Helper to parse the first conflict block (up to 15 lines of markers) from a conflicting file.
 fn extract_conflict_hunk(workdir: Option<&Path>, rel_path: &str) -> Option<ConflictHunk> {
     let base = workdir?;
     let full_path = base.join(rel_path);
@@ -278,26 +293,41 @@ fn extract_conflict_hunk(workdir: Option<&Path>, rel_path: &str) -> Option<Confl
 
     let mut in_ours = false;
     let mut in_theirs = false;
+    let mut in_hunk = false;
     let mut ours_branch = "HEAD".to_string();
     let mut theirs_branch = "incoming".to_string();
     let mut ours_content = Vec::new();
     let mut theirs_content = Vec::new();
+    let mut raw_lines = Vec::new();
     let mut total_lines = 0;
 
     for line in content.lines() {
         if line.starts_with("<<<<<<< ") {
+            in_hunk = true;
             in_ours = true;
             ours_branch = line.trim_start_matches("<<<<<<< ").trim().to_string();
+            if raw_lines.len() < 15 {
+                raw_lines.push(line.to_string());
+            }
             continue;
         }
         if in_ours && line.starts_with("=======") {
             in_ours = false;
             in_theirs = true;
+            if raw_lines.len() < 15 {
+                raw_lines.push(line.to_string());
+            }
             continue;
         }
         if in_theirs && line.starts_with(">>>>>>> ") {
             theirs_branch = line.trim_start_matches(">>>>>>> ").trim().to_string();
+            if raw_lines.len() < 15 {
+                raw_lines.push(line.to_string());
+            }
             break;
+        }
+        if in_hunk && raw_lines.len() < 15 {
+            raw_lines.push(line.to_string());
         }
         if in_ours {
             if ours_content.len() < 20 {
@@ -312,13 +342,14 @@ fn extract_conflict_hunk(workdir: Option<&Path>, rel_path: &str) -> Option<Confl
         }
     }
 
-    if !ours_content.is_empty() || !theirs_content.is_empty() {
+    if !ours_content.is_empty() || !theirs_content.is_empty() || !raw_lines.is_empty() {
         Some(ConflictHunk {
             file_path: rel_path.to_string(),
             ours_branch,
             theirs_branch,
             ours_content,
             theirs_content,
+            raw_lines,
             total_lines,
         })
     } else {
@@ -354,25 +385,25 @@ fn probe_working_tree(repo: &Repository) -> WorkingTreeSummary {
         // Staged (index) changes
         if status.is_index_new() {
             summary.staged_new += 1;
-            if summary.staged_files.len() < 15 && !path.is_empty() {
+            if summary.staged_files.len() < 20 && !path.is_empty() {
                 summary.staged_files.push(format!("A {path}"));
             }
         }
         if status.is_index_modified() {
             summary.staged_modified += 1;
-            if summary.staged_files.len() < 15 && !path.is_empty() {
+            if summary.staged_files.len() < 20 && !path.is_empty() {
                 summary.staged_files.push(format!("M {path}"));
             }
         }
         if status.is_index_deleted() {
             summary.staged_deleted += 1;
-            if summary.staged_files.len() < 15 && !path.is_empty() {
+            if summary.staged_files.len() < 20 && !path.is_empty() {
                 summary.staged_files.push(format!("D {path}"));
             }
         }
         if status.is_index_renamed() {
             summary.staged_renamed += 1;
-            if summary.staged_files.len() < 15 && !path.is_empty() {
+            if summary.staged_files.len() < 20 && !path.is_empty() {
                 summary.staged_files.push(format!("R {path}"));
             }
         }
@@ -380,13 +411,13 @@ fn probe_working_tree(repo: &Repository) -> WorkingTreeSummary {
         // Unstaged (workdir) changes
         if status.is_wt_modified() {
             summary.unstaged_modified += 1;
-            if summary.unstaged_files.len() < 15 && !path.is_empty() {
+            if summary.unstaged_files.len() < 20 && !path.is_empty() {
                 summary.unstaged_files.push(format!("M {path}"));
             }
         }
         if status.is_wt_deleted() {
             summary.unstaged_deleted += 1;
-            if summary.unstaged_files.len() < 15 && !path.is_empty() {
+            if summary.unstaged_files.len() < 20 && !path.is_empty() {
                 summary.unstaged_files.push(format!("D {path}"));
             }
         }
@@ -394,7 +425,7 @@ fn probe_working_tree(repo: &Repository) -> WorkingTreeSummary {
         // Untracked
         if status.is_wt_new() {
             summary.untracked += 1;
-            if summary.untracked_files.len() < 15 && !path.is_empty() {
+            if summary.untracked_files.len() < 20 && !path.is_empty() {
                 summary.untracked_files.push(path.to_string());
             }
         }
@@ -1114,6 +1145,7 @@ mod tests {
                 theirs_branch: "origin/main".to_string(),
                 ours_content: vec!["let token = get_local_token();".to_string()],
                 theirs_content: vec!["let token = get_remote_token();".to_string()],
+                raw_lines: vec![],
                 total_lines: 2,
             }),
         }];
@@ -1121,12 +1153,40 @@ mod tests {
         let fact_sheet = state.to_fact_sheet();
         assert!(fact_sheet.contains("INCOMING_COMMITS:"));
         assert!(fact_sheet.contains("abc1234 feat: upstream change (origin/main)"));
+        assert!(fact_sheet.contains("CONFLICT_HUNKS:"));
         assert!(fact_sheet.contains("CONFLICT_PREVIEW for \"src/auth.rs\" (ours<HEAD> vs theirs<origin/main>):"));
         assert!(fact_sheet.contains("<<<<<<< HEAD"));
         assert!(fact_sheet.contains("let token = get_local_token();"));
         assert!(fact_sheet.contains("======="));
         assert!(fact_sheet.contains("let token = get_remote_token();"));
         assert!(fact_sheet.contains(">>>>>>> origin/main"));
+    }
+
+    #[test]
+    fn test_branches_in_probe_and_fact_sheet() {
+        let (tmp, repo) = init_test_repo();
+
+        // 1. Initial commit on main
+        let f1 = tmp.path().join("main.txt");
+        std::fs::write(&f1, "main\n").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("main.txt")).unwrap();
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let sig = git2::Signature::now("Test", "test@test.com").unwrap();
+        let commit = repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[]).unwrap();
+        let commit_obj = repo.find_commit(commit).unwrap();
+
+        // 2. Create another branch
+        repo.branch("feature/visibility", &commit_obj, false).unwrap();
+
+        let state = probe_repo_state(tmp.path()).expect("probe should succeed");
+        assert!(state.branches.iter().any(|b| b.contains("feature/visibility")));
+
+        let fact_sheet = state.to_fact_sheet();
+        assert!(fact_sheet.contains("BRANCHES:"));
+        assert!(fact_sheet.contains("feature/visibility"));
     }
 }
 

@@ -80,6 +80,10 @@ pub struct RepoState {
     /// Incoming commits on upstream or merge target not yet integrated into HEAD.
     #[serde(default)]
     pub incoming_commits: Vec<CommitEntry>,
+
+    /// Local and remote branch names.
+    #[serde(default)]
+    pub branches: Vec<String>,
 }
 
 /// Information about a linked git worktree.
@@ -197,6 +201,9 @@ pub struct ConflictHunk {
     pub theirs_branch: String,
     pub ours_content: Vec<String>,
     pub theirs_content: Vec<String>,
+    /// Up to 15 raw lines from <<<<<<< through >>>>>>> inclusive.
+    #[serde(default)]
+    pub raw_lines: Vec<String>,
     pub total_lines: usize,
 }
 
@@ -231,13 +238,13 @@ pub struct WorkingTreeSummary {
     pub untracked: usize,
     /// Files matching patterns in `.gitignore` that are tracked (potential secrets).
     pub ignored_but_tracked: usize,
-    /// Actual staged file paths with status indicators (e.g. "M src/auth.rs", "A src/config.rs"), capped at 15.
+    /// Actual staged file paths with status indicators (e.g. "M src/auth.rs", "A src/config.rs"), capped at 20.
     #[serde(default)]
     pub staged_files: Vec<String>,
-    /// Actual unstaged modified/deleted file paths (e.g. "M src/api.rs", "D README.md"), capped at 15.
+    /// Actual unstaged modified/deleted file paths (e.g. "M src/api.rs", "D README.md"), capped at 20.
     #[serde(default)]
     pub unstaged_files: Vec<String>,
-    /// Actual untracked file paths (e.g. "notes.txt"), capped at 15.
+    /// Actual untracked file paths (e.g. "notes.txt"), capped at 20.
     #[serde(default)]
     pub untracked_files: Vec<String>,
 }
@@ -628,6 +635,11 @@ impl RepoState {
         lines.push(format!("[REPO_STATE]"));
         lines.push(format!("HEAD: {}", self.head));
 
+        if !self.branches.is_empty() {
+            let branch_list: Vec<String> = self.branches.iter().take(20).map(|b| format!("\"{}\"", b)).collect();
+            lines.push(format!("BRANCHES: [{}]", branch_list.join(", ")));
+        }
+
         if let Some(ref op) = self.ongoing_operation {
             lines.push(format!("ONGOING_OP: {op}"));
         } else {
@@ -642,10 +654,10 @@ impl RepoState {
                 .collect();
             lines.push(format!("CONFLICTS: [{}]", conflict_list.join(", ")));
 
-            // Extract compact 10-line preview of the first conflict block for up to 3 conflicted files
+            lines.push("CONFLICT_HUNKS:".to_string());
             let mut preview_count = 0;
             for c in &self.conflicts {
-                if preview_count >= 3 {
+                if preview_count >= 5 {
                     break;
                 }
                 if let Some(ref hunk) = c.primary_hunk {
@@ -653,21 +665,27 @@ impl RepoState {
                         "CONFLICT_PREVIEW for \"{}\" (ours<{}> vs theirs<{}>):",
                         hunk.file_path, hunk.ours_branch, hunk.theirs_branch
                     ));
-                    lines.push(format!("<<<<<<< {}", hunk.ours_branch));
-                    for line in hunk.ours_content.iter().take(4) {
-                        lines.push(format!("  {}", line));
+                    if !hunk.raw_lines.is_empty() {
+                        for line in hunk.raw_lines.iter().take(15) {
+                            lines.push(line.clone());
+                        }
+                    } else {
+                        lines.push(format!("<<<<<<< {}", hunk.ours_branch));
+                        for line in hunk.ours_content.iter().take(4) {
+                            lines.push(format!("  {}", line));
+                        }
+                        if hunk.ours_content.len() > 4 {
+                            lines.push("  ...".to_string());
+                        }
+                        lines.push("=======".to_string());
+                        for line in hunk.theirs_content.iter().take(4) {
+                            lines.push(format!("  {}", line));
+                        }
+                        if hunk.theirs_content.len() > 4 {
+                            lines.push("  ...".to_string());
+                        }
+                        lines.push(format!(">>>>>>> {}", hunk.theirs_branch));
                     }
-                    if hunk.ours_content.len() > 4 {
-                        lines.push("  ...".to_string());
-                    }
-                    lines.push("=======".to_string());
-                    for line in hunk.theirs_content.iter().take(4) {
-                        lines.push(format!("  {}", line));
-                    }
-                    if hunk.theirs_content.len() > 4 {
-                        lines.push("  ...".to_string());
-                    }
-                    lines.push(format!(">>>>>>> {}", hunk.theirs_branch));
                     preview_count += 1;
                 }
             }
@@ -681,17 +699,17 @@ impl RepoState {
         ));
 
         if !wt.staged_files.is_empty() {
-            let file_list: Vec<String> = wt.staged_files.iter().take(15).map(|f| format!("\"{}\"", f)).collect();
+            let file_list: Vec<String> = wt.staged_files.iter().take(20).map(|f| format!("\"{}\"", f)).collect();
             lines.push(format!("STAGED_FILES: [{}]", file_list.join(", ")));
         }
 
         if !wt.unstaged_files.is_empty() {
-            let file_list: Vec<String> = wt.unstaged_files.iter().take(15).map(|f| format!("\"{}\"", f)).collect();
+            let file_list: Vec<String> = wt.unstaged_files.iter().take(20).map(|f| format!("\"{}\"", f)).collect();
             lines.push(format!("UNSTAGED_FILES: [{}]", file_list.join(", ")));
         }
 
         if !wt.untracked_files.is_empty() {
-            let file_list: Vec<String> = wt.untracked_files.iter().take(15).map(|f| format!("\"{}\"", f)).collect();
+            let file_list: Vec<String> = wt.untracked_files.iter().take(20).map(|f| format!("\"{}\"", f)).collect();
             lines.push(format!("UNTRACKED_FILES: [{}]", file_list.join(", ")));
         }
 
