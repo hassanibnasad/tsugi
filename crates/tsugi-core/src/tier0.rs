@@ -16,11 +16,83 @@ use crate::types::{
     ResolutionPlan, RiskTier,
 };
 
+/// Determines if the user's intent represents a complex, nuanced, or conversational
+/// instruction that must be reasoned about by the LLM rather than pattern-matched deterministically.
+pub fn is_complex_or_conversational(intent: &str) -> bool {
+    let trimmed = intent.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    // Condition a: More than 7 words
+    let words: Vec<&str> = trimmed.split_whitespace().collect();
+    if words.len() > 7 {
+        return true;
+    }
+
+    // Condition b: Negation, scoping, or conversational modifiers
+    const CONVERSATIONAL_MODIFIERS: &[&str] = &[
+        "don't", "dont", "not", "instead", "without", "except", "only", "keep",
+        "but", "wait", "actually", "why", "how", "explain",
+    ];
+
+    let lower = trimmed.to_lowercase();
+    for word in &words {
+        let clean = word.trim_matches(|c: char| !c.is_alphanumeric() && c != '\'').to_lowercase();
+        if CONVERSATIONAL_MODIFIERS.contains(&clean.as_str()) {
+            return true;
+        }
+    }
+    for modifier in CONVERSATIONAL_MODIFIERS {
+        let padded = format!(" {} ", lower);
+        let target = format!(" {} ", modifier);
+        if padded.contains(&target) {
+            return true;
+        }
+    }
+
+    // Condition c: Contains a file path ('/' or '.' like 'src/', 'auth.rs', '.env')
+    // or hex commit SHA / revision reference ('HEAD~', '@', or 6+ hex chars)
+    for word in &words {
+        // File path with slash: src/auth.rs, config/
+        if word.contains('/') {
+            return true;
+        }
+        // File path with dot: auth.rs, .env, index.ts
+        if word.contains('.') && word.len() > 1 && !word.ends_with("...") {
+            let after_dot = word.split('.').last().unwrap_or("");
+            if !after_dot.is_empty() && after_dot.chars().all(|c| c.is_alphanumeric()) {
+                return true;
+            }
+            if word.starts_with('.') && word.len() > 2 {
+                return true;
+            }
+        }
+        // Revision reference: HEAD~, @, or hex commit SHA (6+ chars with digits)
+        if word.contains("HEAD~") || word.contains('@') {
+            return true;
+        }
+        let clean_hex = word.trim_matches(|c: char| !c.is_ascii_hexdigit());
+        if clean_hex.len() >= 6 && clean_hex.chars().all(|c| c.is_ascii_hexdigit()) {
+            if clean_hex.chars().any(|c| c.is_ascii_digit()) {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
 /// Attempt to resolve the user's Git issue using deterministic pattern matching.
 ///
 /// Returns `Some(ResolutionPlan)` if the issue matches a known canonical pattern,
 /// or `None` if the LLM engine should be consulted.
 pub fn try_resolve(state: &RepoState, user_intent: &str) -> Option<ResolutionPlan> {
+    // Return None (defer to LLM) if query is complex, conversational, or file-specific
+    if is_complex_or_conversational(user_intent) {
+        return None;
+    }
+
     let intent = user_intent.to_lowercase();
     let current_branch = match state.head {
         HeadState::Attached { ref branch, .. } => branch.as_str(),

@@ -114,11 +114,13 @@ impl TsugiEngine {
         user_intent: &str,
         session_history: &[crate::types::SessionTurn],
     ) -> Result<PlanOutcome, TsugiError> {
-        // Step 1: Try Tier-0 deterministic fast-path
-        if let Some(t0_plan) = tier0::try_resolve(state, user_intent) {
-            info!("Tier-0 fast-path matched — no LLM needed");
-            let guarded = guardrail::apply_guardrails(t0_plan, &self.config)?;
-            return Ok(PlanOutcome::Ready(guarded));
+        // Step 1: Try Tier-0 deterministic fast-path (only on first turn without conversation context)
+        if session_history.is_empty() {
+            if let Some(t0_plan) = tier0::try_resolve(state, user_intent) {
+                info!("Tier-0 fast-path matched — no LLM needed");
+                let guarded = guardrail::apply_guardrails(t0_plan, &self.config)?;
+                return Ok(PlanOutcome::Ready(guarded));
+            }
         }
 
         // Step 2: Fall back to local inference backend with conversation context
