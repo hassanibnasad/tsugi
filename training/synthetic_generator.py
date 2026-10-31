@@ -107,6 +107,11 @@ def format_repo_state(
     safe_rollback_target: Optional[str] = None,
     recent_commits: Optional[List[str]] = None,
     reflog: Optional[List[str]] = None,
+    staged_files: Optional[List[str]] = None,
+    unstaged_files: Optional[List[str]] = None,
+    untracked_files: Optional[List[str]] = None,
+    incoming_commits: Optional[List[str]] = None,
+    conflict_previews: Optional[List[str]] = None,
 ) -> str:
     """Formats Symbolic State Fact Sheet in exact format expected by Rust runtime."""
     lines = ["[REPO_STATE]"]
@@ -124,7 +129,23 @@ def format_repo_state(
                 conflict_strs.append(f'"{c}" (both_modified)')
         lines.append(f"CONFLICTS: [{', '.join(conflict_strs)}]")
 
+        if conflict_previews:
+            for prev in conflict_previews[:3]:
+                lines.append(prev)
+
     lines.append(f"STAGED: {staged} | UNSTAGED: {unstaged} | UNTRACKED: {untracked}")
+
+    if staged_files:
+        quoted = [f'"{f}"' for f in staged_files[:15]]
+        lines.append(f"STAGED_FILES: [{', '.join(quoted)}]")
+
+    if unstaged_files:
+        quoted = [f'"{f}"' for f in unstaged_files[:15]]
+        lines.append(f"UNSTAGED_FILES: [{', '.join(quoted)}]")
+
+    if untracked_files:
+        quoted = [f'"{f}"' for f in untracked_files[:15]]
+        lines.append(f"UNTRACKED_FILES: [{', '.join(quoted)}]")
 
     if tracking:
         lines.append(f"TRACKING: {tracking}")
@@ -134,6 +155,11 @@ def format_repo_state(
 
     if safe_rollback_target:
         lines.append(f"SAFE_ROLLBACK_TARGET: {safe_rollback_target}")
+
+    if incoming_commits:
+        lines.append("INCOMING_COMMITS:")
+        for c in incoming_commits[:5]:
+            lines.append(f"  {c}")
 
     if recent_commits:
         lines.append("RECENT_COMMITS:")
@@ -146,6 +172,30 @@ def format_repo_state(
             lines.append(f"  {r}")
 
     return "\n".join(lines)
+
+
+def normalize_plan(plan: Dict[str, Any]) -> Dict[str, Any]:
+    """Ensures 100% schema alignment with Rust runtime, GBNF grammar, and confidence scoring."""
+    risk_tier = plan.get("risk_tier", "MUTATING_SAFE")
+    steps = []
+    for step in plan.get("execution_steps", []):
+        cmd = step["cmd"]
+        is_dangerous = any(d in cmd for d in [
+            "--hard", "--force", "-D", "clean -f", "prune", "drop"
+        ]) or risk_tier in ("MUTATING_DANGEROUS", "HISTORY_REWRITE")
+        req_conf = step.get("requires_confirmation", is_dangerous)
+        steps.append({
+            "cmd": cmd,
+            "explanation": step["explanation"],
+            "requires_confirmation": req_conf,
+        })
+    return {
+        "root_cause": plan["root_cause"],
+        "risk_tier": risk_tier,
+        "execution_steps": steps,
+        "rollback_cmd": plan.get("rollback_cmd", "git status"),
+        "confidence": plan.get("confidence", 0.95),
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -933,6 +983,312 @@ def incident_bisect_abort(rng: random.Random) -> Tuple[str, str, Dict[str, Any]]
     return fact_sheet, rng.choice(intents), plan
 
 
+def incident_repl_keep_unstaged_instead(rng: random.Random) -> Tuple[str, str, Dict[str, Any], List[Tuple[str, str]]]:
+    branch = random_branch(rng)
+    sha = random_sha(rng)
+    files = rng.sample(FILES, 2)
+    fact_sheet = format_repo_state(
+        head=f"ATTACHED to {branch} ({sha})",
+        ongoing_op="NONE",
+        staged="+0 ~0 -0 R0",
+        unstaged="~2 -0",
+        untracked=0,
+        unstaged_files=[f"M {f}" for f in files],
+        recent_commits=[f"{sha} {rng.choice(COMMIT_SUMMARIES)}"]
+    )
+    history = [
+        ("Switch to main and pull latest changes", "Stash modified files and switch to main")
+    ]
+    intents = [
+        "Wait, keep my unstaged changes instead without stashing them",
+        "Don't stash, keep my working directory edits and switch branch",
+        "Instead of stashing, bring my unstaged modifications along to main",
+    ]
+    plan = {
+        "root_cause": "User requested switching branches while carrying over unstaged working directory changes.",
+        "risk_tier": "MUTATING_SAFE",
+        "execution_steps": [
+            {
+                "cmd": "git switch -m main",
+                "explanation": "Switch to branch 'main' and merge local uncommitted changes into the destination tree.",
+                "requires_confirmation": False
+            }
+        ],
+        "rollback_cmd": f"git switch -m {branch}",
+        "confidence": 0.96
+    }
+    return fact_sheet, rng.choice(intents), plan, history
+
+
+def incident_repl_only_stage_auth_and_stash_rest(rng: random.Random) -> Tuple[str, str, Dict[str, Any], List[Tuple[str, str]]]:
+    branch = random_branch(rng)
+    sha = random_sha(rng)
+    auth_file = "src/auth.ts"
+    other_files = rng.sample(FILES, 2)
+    all_files = [auth_file] + other_files
+    fact_sheet = format_repo_state(
+        head=f"ATTACHED to {branch} ({sha})",
+        ongoing_op="NONE",
+        staged="+0 ~0 -0 R0",
+        unstaged=f"~{len(all_files)} -0",
+        untracked=0,
+        unstaged_files=[f"M {f}" for f in all_files],
+        recent_commits=[f"{sha} {rng.choice(COMMIT_SUMMARIES)}"]
+    )
+    history = [
+        ("Prepare commit for all modified files", "Stage all working modifications into index")
+    ]
+    intents = [
+        f"Wait, only stage {auth_file} and stash the rest",
+        f"Only stage {auth_file} and stash other unstaged modifications",
+        f"Don't stage everything—only stage {auth_file} and stash the remaining files",
+    ]
+    plan = {
+        "root_cause": f"Selective staging of {auth_file} while stashing remaining modified files.",
+        "risk_tier": "MUTATING_SAFE",
+        "execution_steps": [
+            {
+                "cmd": f"git add {auth_file}",
+                "explanation": f"Stage {auth_file} for commit.",
+                "requires_confirmation": False
+            },
+            {
+                "cmd": f"git stash push -m \"wip: stash non-auth modifications\" -- {' '.join(other_files)}",
+                "explanation": "Stash the remaining unstaged files into stash storage.",
+                "requires_confirmation": False
+            }
+        ],
+        "rollback_cmd": f"git restore --staged {auth_file} && git stash pop",
+        "confidence": 0.95
+    }
+    return fact_sheet, rng.choice(intents), plan, history
+
+
+def incident_repl_skip_rebase_instead_of_abort(rng: random.Random) -> Tuple[str, str, Dict[str, Any], List[Tuple[str, str]]]:
+    branch = random_branch(rng)
+    sha = random_sha(rng)
+    conf_file = rng.choice(FILES)
+    step_cur = rng.randint(2, 4)
+    step_total = step_cur + 2
+    fact_sheet = format_repo_state(
+        head=f"DETACHED at {sha}",
+        ongoing_op=f"REBASE in progress (step {step_cur}/{step_total}) onto origin/main",
+        conflicts=[f'"{conf_file}" (both_modified)'],
+        staged="+0 ~0 -0 R0",
+        unstaged="~1 -0",
+        untracked=0,
+        tracking=f"origin/{branch} (ahead 3, behind 2)",
+        unstaged_files=[f"M {conf_file}"],
+        conflict_previews=[
+            f"CONFLICT_PREVIEW for \"{conf_file}\" (ours<HEAD> vs theirs<origin/main>):\n<<<<<<< HEAD\n  old_impl();\n=======\n  new_impl();\n>>>>>>> origin/main"
+        ],
+        incoming_commits=[f"{random_sha(rng)} {rng.choice(COMMIT_SUMMARIES)}"],
+        recent_commits=[f"{sha} {rng.choice(COMMIT_SUMMARIES)}"]
+    )
+    history = [
+        ("Rebase conflict encountered", "Conflict in " + conf_file + "; abort or resolve")
+    ]
+    intents = [
+        "Don't abort the rebase—I want to skip this commit and keep rebasing onto main",
+        "Skip this conflicting commit and continue rebase instead of aborting",
+        "Do not abort, skip this commit and proceed with the rest of the rebase",
+    ]
+    plan = {
+        "root_cause": f"User elected to drop/skip conflicted commit at step {step_cur}/{step_total} and continue rebase.",
+        "risk_tier": "MUTATING_SAFE",
+        "execution_steps": [
+            {
+                "cmd": "git rebase --skip",
+                "explanation": "Skip applying current commit and continue rebasing remaining commits onto main.",
+                "requires_confirmation": False
+            }
+        ],
+        "rollback_cmd": "git rebase --abort",
+        "confidence": 0.98
+    }
+    return fact_sheet, rng.choice(intents), plan, history
+
+
+def incident_repl_restore_file_without_resetting_staged(rng: random.Random) -> Tuple[str, str, Dict[str, Any], List[Tuple[str, str]]]:
+    branch = random_branch(rng)
+    sha = random_sha(rng)
+    staged_file = rng.choice(FILES)
+    target_file = "src/api/handler.rs"
+    fact_sheet = format_repo_state(
+        head=f"ATTACHED to {branch} ({sha})",
+        ongoing_op="NONE",
+        staged="+0 ~1 -0 R0",
+        unstaged="~1 -0",
+        untracked=0,
+        staged_files=[f"M {staged_file}"],
+        unstaged_files=[f"M {target_file}"],
+        recent_commits=[
+            f"{sha} {rng.choice(COMMIT_SUMMARIES)}",
+            f"{random_sha(rng)} {rng.choice(COMMIT_SUMMARIES)}",
+            f"{random_sha(rng)} {rng.choice(COMMIT_SUMMARIES)}"
+        ]
+    )
+    history = [
+        ("Review my staged work", f"1 file staged ({staged_file}), 1 unstaged ({target_file})")
+    ]
+    intents = [
+        f"Undo the changes in {target_file} from 2 commits ago without resetting my staged work",
+        f"Restore {target_file} from HEAD~2 but keep my staged {staged_file} intact",
+        f"Revert changes in {target_file} to 2 commits ago without affecting staged changes",
+    ]
+    plan = {
+        "root_cause": f"Restoring specific file '{target_file}' from revision HEAD~2 while keeping staged '{staged_file}' intact.",
+        "risk_tier": "MUTATING_SAFE",
+        "execution_steps": [
+            {
+                "cmd": f"git restore --source=HEAD~2 --worktree {target_file}",
+                "explanation": f"Restore working tree version of '{target_file}' to HEAD~2 state without touching staged index.",
+                "requires_confirmation": False
+            }
+        ],
+        "rollback_cmd": f"git checkout HEAD -- {target_file}",
+        "confidence": 0.96
+    }
+    return fact_sheet, rng.choice(intents), plan, history
+
+
+def incident_repl_take_incoming_for_config_keep_ours_for_code(rng: random.Random) -> Tuple[str, str, Dict[str, Any], List[Tuple[str, str]]]:
+    branch = random_branch(rng)
+    sha = random_sha(rng)
+    merge_sha = random_sha(rng)
+    fact_sheet = format_repo_state(
+        head=f"ATTACHED to {branch} ({sha})",
+        ongoing_op=f"MERGE in progress (merging {merge_sha})",
+        conflicts=['"package.json" (both_modified)', '"src/index.ts" (both_modified)'],
+        staged="+0 ~0 -0 R0",
+        unstaged="~2 -0",
+        untracked=0,
+        unstaged_files=["M package.json", "M src/index.ts"],
+        incoming_commits=[f"{merge_sha} Bump dependencies in package.json"],
+        conflict_previews=[
+            "CONFLICT_PREVIEW for \"package.json\" (ours<HEAD> vs theirs<incoming>):\n<<<<<<< HEAD\n  \"version\": \"1.0.0\"\n=======\n  \"version\": \"1.1.0\"\n>>>>>>> incoming"
+        ]
+    )
+    history = [
+        ("Automatic merge stopped on conflicts", "Conflicts in package.json and src/index.ts")
+    ]
+    intents = [
+        "Take incoming changes from upstream for package.json, but keep our changes for src/index.ts",
+        "For package.json use theirs, but for src/index.ts use ours",
+        "Accept theirs for package.json and accept ours for src/index.ts",
+    ]
+    plan = {
+        "root_cause": "Granular multi-file conflict resolution: accept upstream version of package.json and local version of src/index.ts.",
+        "risk_tier": "MUTATING_SAFE",
+        "execution_steps": [
+            {
+                "cmd": "git checkout --theirs package.json",
+                "explanation": "Accept upstream version of package.json to resolve conflict.",
+                "requires_confirmation": False
+            },
+            {
+                "cmd": "git add package.json",
+                "explanation": "Stage resolved package.json.",
+                "requires_confirmation": False
+            },
+            {
+                "cmd": "git checkout --ours src/index.ts",
+                "explanation": "Retain local working branch version of src/index.ts.",
+                "requires_confirmation": False
+            },
+            {
+                "cmd": "git add src/index.ts",
+                "explanation": "Stage resolved src/index.ts.",
+                "requires_confirmation": False
+            }
+        ],
+        "rollback_cmd": "git merge --abort",
+        "confidence": 0.98
+    }
+    return fact_sheet, rng.choice(intents), plan, history
+
+
+def incident_repl_clean_untracked_logs_keep_code(rng: random.Random) -> Tuple[str, str, Dict[str, Any], List[Tuple[str, str]]]:
+    branch = random_branch(rng)
+    sha = random_sha(rng)
+    code_file = rng.choice(FILES)
+    log_files = ["debug.log", "test_output.log"]
+    fact_sheet = format_repo_state(
+        head=f"ATTACHED to {branch} ({sha})",
+        ongoing_op="NONE",
+        staged="+0 ~0 -0 R0",
+        unstaged="~1 -0",
+        untracked=2,
+        unstaged_files=[f"M {code_file}"],
+        untracked_files=log_files,
+        recent_commits=[f"{sha} {rng.choice(COMMIT_SUMMARIES)}"]
+    )
+    history = [
+        ("Check git status", f"Modified {code_file} and 2 untracked log files")
+    ]
+    intents = [
+        "Only discard the untracked log files, don't touch my modified code",
+        "Delete untracked log files without resetting my modified source files",
+        "Clean only debug.log and test_output.log, keep working tree edits",
+    ]
+    plan = {
+        "root_cause": "Targeted deletion of untracked log files while strictly protecting modified code.",
+        "risk_tier": "MUTATING_SAFE",
+        "execution_steps": [
+            {
+                "cmd": f"git clean -f -- {' '.join(log_files)}",
+                "explanation": "Force remove specified untracked log files while leaving modified files untouched.",
+                "requires_confirmation": False
+            }
+        ],
+        "rollback_cmd": "git status",
+        "confidence": 0.95
+    }
+    return fact_sheet, rng.choice(intents), plan, history
+
+
+def incident_repl_fast_forward_upstream(rng: random.Random) -> Tuple[str, str, Dict[str, Any], List[Tuple[str, str]]]:
+    branch = random_branch(rng)
+    sha = random_sha(rng)
+    inc_sha1 = random_sha(rng)
+    inc_sha2 = random_sha(rng)
+    fact_sheet = format_repo_state(
+        head=f"ATTACHED to {branch} ({sha})",
+        ongoing_op="NONE",
+        staged="+0 ~0 -0 R0",
+        unstaged="~0 -0",
+        untracked=0,
+        tracking=f"origin/{branch} (ahead 0, behind 2)",
+        incoming_commits=[
+            f"{inc_sha1} {rng.choice(COMMIT_SUMMARIES)}",
+            f"{inc_sha2} {rng.choice(COMMIT_SUMMARIES)}"
+        ],
+        recent_commits=[f"{sha} {rng.choice(COMMIT_SUMMARIES)}"]
+    )
+    history = [
+        ("Check tracking status", "Branch is 2 commits behind origin/" + branch)
+    ]
+    intents = [
+        "Fast-forward the branch without creating a merge commit",
+        "Update branch with upstream using fast-forward only",
+        "Fast forward my branch to match upstream remote",
+    ]
+    plan = {
+        "root_cause": f"Branch '{branch}' is strictly 2 commits behind upstream; fast-forward merge is possible without merge commit.",
+        "risk_tier": "MUTATING_SAFE",
+        "execution_steps": [
+            {
+                "cmd": f"git merge --ff-only origin/{branch}",
+                "explanation": f"Fast-forward branch to match origin/{branch} without creating a merge commit.",
+                "requires_confirmation": False
+            }
+        ],
+        "rollback_cmd": f"git reset --hard {sha}",
+        "confidence": 0.97
+    }
+    return fact_sheet, rng.choice(intents), plan, history
+
+
 INCIDENT_GENERATORS = [
     incident_merge_conflict,
     incident_rebase_conflict,
@@ -954,6 +1310,13 @@ INCIDENT_GENERATORS = [
     incident_unborn_repo_first_commit,
     incident_discard_unstaged_file,
     incident_bisect_abort,
+    incident_repl_keep_unstaged_instead,
+    incident_repl_only_stage_auth_and_stash_rest,
+    incident_repl_skip_rebase_instead_of_abort,
+    incident_repl_restore_file_without_resetting_staged,
+    incident_repl_take_incoming_for_config_keep_ours_for_code,
+    incident_repl_clean_untracked_logs_keep_code,
+    incident_repl_fast_forward_upstream,
 ]
 
 
@@ -965,9 +1328,24 @@ def build_chatml_dataset(output_file: Path, total_examples: int = 5000, seed: in
 
     for i in range(total_examples):
         generator = rng.choice(INCIDENT_GENERATORS)
-        fact_sheet, intent, plan = generator(rng)
+        gen_res = generator(rng)
+        if len(gen_res) == 4:
+            fact_sheet, intent, raw_plan, history = gen_res
+        else:
+            fact_sheet, intent, raw_plan = gen_res
+            history = []
 
-        user_content = f"{fact_sheet}\n\nUSER_INTENT: {intent}"
+        plan = normalize_plan(raw_plan)
+
+        if history:
+            history_lines = ["\nPREVIOUS_TURNS:"]
+            for h_user, h_asst in history[-3:]:
+                history_lines.append(f"- USER: {h_user}\n  ASSISTANT: {h_asst}")
+            history_str = "\n".join(history_lines) + "\n\n"
+        else:
+            history_str = "\n\n"
+
+        user_content = f"{fact_sheet}{history_str}USER_INTENT: {intent}"
         assistant_content = json.dumps(plan, indent=2)
 
         prompt_key = (fact_sheet, intent)
