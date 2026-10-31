@@ -3,7 +3,7 @@ root ::= "{" ws
     "\"root_cause\"" ws ":" ws string "," ws
     "\"risk_tier\"" ws ":" ws risk-tier "," ws
     "\"execution_steps\"" ws ":" ws "[" ws step ("," ws step)* ws "]" "," ws
-    "\"rollback_cmd\"" ws ":" ws string ws
+    "\"rollback_cmd\"" ws ":" ws string ("," ws "\"confidence\"" ws ":" ws number)? ws
     "}"
 
 # A single execution step
@@ -13,6 +13,7 @@ step ::= "{" ws
     "}"
 
 boolean ::= "true" | "false"
+number ::= [0-9]+ ("." [0-9]+)?
 
 # Risk tier enum — exactly one of these four values
 risk-tier ::= "\"READ_ONLY\"" | "\"MUTATING_SAFE\"" | "\"MUTATING_DANGEROUS\"" | "\"HISTORY_REWRITE\""

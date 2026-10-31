@@ -500,6 +500,8 @@ struct LlmOutput {
     risk_tier: String,
     execution_steps: Vec<LlmStep>,
     rollback_cmd: String,
+    #[serde(default)]
+    confidence: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -543,13 +545,15 @@ fn parse_llm_output(raw: &str) -> Result<ResolutionPlan, TsugiError> {
         })
         .collect();
 
+    let confidence = output.confidence.unwrap_or(0.85);
+
     Ok(ResolutionPlan {
         root_cause: output.root_cause,
         risk_tier,
         execution_steps,
         rollback_cmd: output.rollback_cmd,
         source: PlanSource::LlmPrimary, // Will be overwritten by caller
-        confidence: 0.85, // Default confidence for LLM plans
+        confidence,
     })
 }
 
@@ -612,7 +616,7 @@ root ::= "{" ws
     "\"root_cause\"" ws ":" ws string "," ws
     "\"risk_tier\"" ws ":" ws risk-tier "," ws
     "\"execution_steps\"" ws ":" ws "[" ws step ("," ws step)* ws "]" "," ws
-    "\"rollback_cmd\"" ws ":" ws string ws
+    "\"rollback_cmd\"" ws ":" ws string ("," ws "\"confidence\"" ws ":" ws number)? ws
     "}"
 
 step ::= "{" ws
@@ -621,6 +625,7 @@ step ::= "{" ws
     "}"
 
 boolean ::= "true" | "false"
+number ::= [0-9]+ ("." [0-9]+)?
 
 risk-tier ::= "\"READ_ONLY\"" | "\"MUTATING_SAFE\"" | "\"MUTATING_DANGEROUS\"" | "\"HISTORY_REWRITE\""
 
@@ -658,6 +663,16 @@ Done!"#;
         let plan = plan.unwrap();
         assert_eq!(plan.risk_tier, RiskTier::MutatingSafe);
         assert_eq!(plan.execution_steps.len(), 1);
+        assert_eq!(plan.confidence, 0.85);
+    }
+
+    #[test]
+    fn test_parse_llm_output_with_confidence_and_confirmation() {
+        let json = r#"{"root_cause": "Diverged branch", "risk_tier": "MUTATING_DANGEROUS", "execution_steps": [{"cmd": "git push --force-with-lease origin main", "explanation": "Push with lease", "requires_confirmation": true}], "rollback_cmd": "git reset --hard ORIG_HEAD", "confidence": 0.98}"#;
+        let plan = parse_llm_output(json).unwrap();
+        assert_eq!(plan.risk_tier, RiskTier::MutatingDangerous);
+        assert_eq!(plan.confidence, 0.98);
+        assert_eq!(plan.execution_steps[0].requires_confirmation, true);
     }
 
     #[test]
