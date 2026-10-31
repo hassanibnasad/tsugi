@@ -61,6 +61,7 @@ pub fn probe_repo_state(path: &Path) -> Result<RepoState, TsugiError> {
     let recent_commits = probe_recent_commits(&repo);
     let recent_reflog = probe_reflog(&repo);
     let tracking = probe_tracking(&repo);
+    let incoming_commits = probe_incoming_commits(&repo, &tracking, &ongoing_operation);
     let stash_count = probe_stash_count(&repo);
     let has_submodules = probe_submodules(&repo);
     let safe_rollback_ref = compute_safe_rollback(&repo, &ongoing_operation);
@@ -91,6 +92,7 @@ pub fn probe_repo_state(path: &Path) -> Result<RepoState, TsugiError> {
         large_files,
         installed_hooks,
         graph_metrics,
+        incoming_commits,
     })
 }
 
@@ -347,32 +349,54 @@ fn probe_working_tree(repo: &Repository) -> WorkingTreeSummary {
 
     for entry in statuses.iter() {
         let status = entry.status();
+        let path = entry.path().unwrap_or("");
 
         // Staged (index) changes
         if status.is_index_new() {
             summary.staged_new += 1;
+            if summary.staged_files.len() < 15 && !path.is_empty() {
+                summary.staged_files.push(format!("A {path}"));
+            }
         }
         if status.is_index_modified() {
             summary.staged_modified += 1;
+            if summary.staged_files.len() < 15 && !path.is_empty() {
+                summary.staged_files.push(format!("M {path}"));
+            }
         }
         if status.is_index_deleted() {
             summary.staged_deleted += 1;
+            if summary.staged_files.len() < 15 && !path.is_empty() {
+                summary.staged_files.push(format!("D {path}"));
+            }
         }
         if status.is_index_renamed() {
             summary.staged_renamed += 1;
+            if summary.staged_files.len() < 15 && !path.is_empty() {
+                summary.staged_files.push(format!("R {path}"));
+            }
         }
 
         // Unstaged (workdir) changes
         if status.is_wt_modified() {
             summary.unstaged_modified += 1;
+            if summary.unstaged_files.len() < 15 && !path.is_empty() {
+                summary.unstaged_files.push(format!("M {path}"));
+            }
         }
         if status.is_wt_deleted() {
             summary.unstaged_deleted += 1;
+            if summary.unstaged_files.len() < 15 && !path.is_empty() {
+                summary.unstaged_files.push(format!("D {path}"));
+            }
         }
 
         // Untracked
         if status.is_wt_new() {
             summary.untracked += 1;
+            if summary.untracked_files.len() < 15 && !path.is_empty() {
+                summary.untracked_files.push(path.to_string());
+            }
         }
     }
 
@@ -390,35 +414,42 @@ impl Default for WorkingTreeSummary {
             unstaged_deleted: 0,
             untracked: 0,
             ignored_but_tracked: 0,
+            staged_files: Vec::new(),
+            unstaged_files: Vec::new(),
+            untracked_files: Vec::new(),
         }
     }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Recent Commits
+// Recent Commits & Incoming Commits
 // ─────────────────────────────────────────────────────────────────────────────
 
-fn probe_recent_commits(repo: &Repository) -> Vec<CommitEntry> {
-    let head_oid = match repo.head().ok().and_then(|h| h.target()) {
-        Some(oid) => oid,
-        None => return Vec::new(),
-    };
-
+fn walk_commits(
+    repo: &Repository,
+    target_oid: git2::Oid,
+    hide_oid: Option<git2::Oid>,
+    max_count: usize,
+) -> Vec<CommitEntry> {
     let mut revwalk = match repo.revwalk() {
         Ok(rw) => rw,
         Err(_) => return Vec::new(),
     };
 
-    if revwalk.push(head_oid).is_err() {
+    if revwalk.push(target_oid).is_err() {
         return Vec::new();
     }
 
+    if let Some(hide) = hide_oid {
+        let _ = revwalk.hide(hide);
+    }
+
     revwalk
-        .take(MAX_RECENT_COMMITS)
+        .take(max_count)
         .filter_map(|oid_result| {
             let oid = oid_result.ok()?;
             let commit = repo.find_commit(oid).ok()?;
-            let sha_short = oid.to_string()[..7].to_string();
+            let sha_short = oid.to_string()[..7.min(oid.to_string().len())].to_string();
             let message_oneline = commit
                 .summary()
                 .ok()
@@ -434,7 +465,6 @@ fn probe_recent_commits(repo: &Repository) -> Vec<CommitEntry> {
                     .unwrap_or_else(|| secs.to_string())
             };
 
-            // Collect decorations (branch names, tags pointing to this commit)
             let decorations = collect_decorations(repo, oid);
 
             Some(CommitEntry {
@@ -446,6 +476,75 @@ fn probe_recent_commits(repo: &Repository) -> Vec<CommitEntry> {
             })
         })
         .collect()
+}
+
+fn probe_recent_commits(repo: &Repository) -> Vec<CommitEntry> {
+    let head_oid = match repo.head().ok().and_then(|h| h.target()) {
+        Some(oid) => oid,
+        None => return Vec::new(),
+    };
+    walk_commits(repo, head_oid, None, MAX_RECENT_COMMITS)
+}
+
+fn probe_incoming_commits(
+    repo: &Repository,
+    tracking: &Option<TrackingInfo>,
+    ongoing_operation: &Option<OngoingOperation>,
+) -> Vec<CommitEntry> {
+    let head_oid = repo.head().ok().and_then(|h| h.target());
+
+    // Case 1: Active branch tracking upstream with behind > 0
+    if let Some(tr) = tracking {
+        if tr.behind > 0 {
+            if let Ok(head) = repo.head() {
+                if let Ok(branch_name) = head.shorthand() {
+                    if let Ok(local_branch) = repo.find_branch(branch_name, git2::BranchType::Local) {
+                        if let Ok(upstream) = local_branch.upstream() {
+                            if let Some(upstream_oid) = upstream.get().target() {
+                                let commits = walk_commits(repo, upstream_oid, head_oid, 5);
+                                if !commits.is_empty() {
+                                    return commits;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Case 2: Ongoing Merge or Rebase operation
+    if let Some(op) = ongoing_operation {
+        match op {
+            OngoingOperation::Merge { merge_head } => {
+                if let Ok(merge_oid) = git2::Oid::from_str(merge_head) {
+                    let commits = walk_commits(repo, merge_oid, head_oid, 5);
+                    if !commits.is_empty() {
+                        return commits;
+                    }
+                }
+            }
+            OngoingOperation::Rebase { onto_branch, .. } => {
+                let onto_oid = read_git_file(repo, "rebase-merge/onto")
+                    .or_else(|| read_git_file(repo, "rebase-apply/onto"))
+                    .and_then(|s| git2::Oid::from_str(&s).ok())
+                    .or_else(|| {
+                        onto_branch.as_ref().and_then(|b| {
+                            repo.resolve_reference_from_short_name(b).ok().and_then(|r| r.target())
+                        })
+                    });
+                if let Some(oid) = onto_oid {
+                    let commits = walk_commits(repo, oid, head_oid, 5);
+                    if !commits.is_empty() {
+                        return commits;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Vec::new()
 }
 
 /// Collect branch/tag names that point to a specific commit OID.
@@ -952,6 +1051,82 @@ mod tests {
         let docs_entry = changed.iter().find(|c| c.path == "docs.md").expect("found docs");
         assert_eq!(docs_entry.status, FileDeltaStatus::Untracked);
         assert_eq!(docs_entry.additions, 2);
+    }
+
+    #[test]
+    fn test_file_lists_in_probe_and_fact_sheet() {
+        let (tmp, repo) = init_test_repo();
+
+        // 1. Initial commit
+        let f1 = tmp.path().join("base.txt");
+        std::fs::write(&f1, "initial\n").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("base.txt")).unwrap();
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let sig = git2::Signature::now("Test", "test@test.com").unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[]).unwrap();
+
+        // 2. Stage a new file
+        let f2 = tmp.path().join("staged_new.txt");
+        std::fs::write(&f2, "staged content\n").unwrap();
+        index.add_path(Path::new("staged_new.txt")).unwrap();
+        index.write().unwrap();
+
+        // 3. Unstaged modification
+        std::fs::write(&f1, "initial\nmodified unstaged\n").unwrap();
+
+        // 4. Untracked file
+        let f3 = tmp.path().join("untracked_file.rs");
+        std::fs::write(&f3, "fn main() {}\n").unwrap();
+
+        let state = probe_repo_state(tmp.path()).expect("probe should succeed");
+        assert_eq!(state.working_tree.staged_files, vec!["A staged_new.txt".to_string()]);
+        assert_eq!(state.working_tree.unstaged_files, vec!["M base.txt".to_string()]);
+        assert_eq!(state.working_tree.untracked_files, vec!["untracked_file.rs".to_string()]);
+
+        let fact_sheet = state.to_fact_sheet();
+        assert!(fact_sheet.contains("STAGED_FILES: [\"A staged_new.txt\"]"));
+        assert!(fact_sheet.contains("UNSTAGED_FILES: [\"M base.txt\"]"));
+        assert!(fact_sheet.contains("UNTRACKED_FILES: [\"untracked_file.rs\"]"));
+    }
+
+    #[test]
+    fn test_conflict_previews_and_incoming_commits_in_fact_sheet() {
+        let (tmp, _repo) = init_test_repo();
+        let mut state = probe_repo_state(tmp.path()).expect("probe should succeed");
+
+        state.incoming_commits = vec![CommitEntry {
+            sha_short: "abc1234".to_string(),
+            message_oneline: "feat: upstream change".to_string(),
+            author: "Alice".to_string(),
+            timestamp: "2026-10-31 12:00".to_string(),
+            decorations: vec!["origin/main".to_string()],
+        }];
+
+        state.conflicts = vec![ConflictEntry {
+            path: "src/auth.rs".to_string(),
+            conflict_type: ConflictType::BothModified,
+            primary_hunk: Some(ConflictHunk {
+                file_path: "src/auth.rs".to_string(),
+                ours_branch: "HEAD".to_string(),
+                theirs_branch: "origin/main".to_string(),
+                ours_content: vec!["let token = get_local_token();".to_string()],
+                theirs_content: vec!["let token = get_remote_token();".to_string()],
+                total_lines: 2,
+            }),
+        }];
+
+        let fact_sheet = state.to_fact_sheet();
+        assert!(fact_sheet.contains("INCOMING_COMMITS:"));
+        assert!(fact_sheet.contains("abc1234 feat: upstream change (origin/main)"));
+        assert!(fact_sheet.contains("CONFLICT_PREVIEW for \"src/auth.rs\" (ours<HEAD> vs theirs<origin/main>):"));
+        assert!(fact_sheet.contains("<<<<<<< HEAD"));
+        assert!(fact_sheet.contains("let token = get_local_token();"));
+        assert!(fact_sheet.contains("======="));
+        assert!(fact_sheet.contains("let token = get_remote_token();"));
+        assert!(fact_sheet.contains(">>>>>>> origin/main"));
     }
 }
 

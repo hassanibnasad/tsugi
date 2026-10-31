@@ -76,6 +76,10 @@ pub struct RepoState {
     /// Graph metrics (branches, tags, merge commits).
     #[serde(default)]
     pub graph_metrics: Option<CommitGraphMetrics>,
+
+    /// Incoming commits on upstream or merge target not yet integrated into HEAD.
+    #[serde(default)]
+    pub incoming_commits: Vec<CommitEntry>,
 }
 
 /// Information about a linked git worktree.
@@ -227,6 +231,15 @@ pub struct WorkingTreeSummary {
     pub untracked: usize,
     /// Files matching patterns in `.gitignore` that are tracked (potential secrets).
     pub ignored_but_tracked: usize,
+    /// Actual staged file paths with status indicators (e.g. "M src/auth.rs", "A src/config.rs"), capped at 15.
+    #[serde(default)]
+    pub staged_files: Vec<String>,
+    /// Actual unstaged modified/deleted file paths (e.g. "M src/api.rs", "D README.md"), capped at 15.
+    #[serde(default)]
+    pub unstaged_files: Vec<String>,
+    /// Actual untracked file paths (e.g. "notes.txt"), capped at 15.
+    #[serde(default)]
+    pub untracked_files: Vec<String>,
 }
 
 impl WorkingTreeSummary {
@@ -629,14 +642,33 @@ impl RepoState {
                 .collect();
             lines.push(format!("CONFLICTS: [{}]", conflict_list.join(", ")));
 
-            // Include primary conflict hunk context if available
+            // Extract compact 10-line preview of the first conflict block for up to 3 conflicted files
+            let mut preview_count = 0;
             for c in &self.conflicts {
+                if preview_count >= 3 {
+                    break;
+                }
                 if let Some(ref hunk) = c.primary_hunk {
                     lines.push(format!(
-                        "CONFLICT_HUNK: \"{}\" ours<{}> vs theirs<{}> ({} lines)",
-                        hunk.file_path, hunk.ours_branch, hunk.theirs_branch, hunk.total_lines
+                        "CONFLICT_PREVIEW for \"{}\" (ours<{}> vs theirs<{}>):",
+                        hunk.file_path, hunk.ours_branch, hunk.theirs_branch
                     ));
-                    break;
+                    lines.push(format!("<<<<<<< {}", hunk.ours_branch));
+                    for line in hunk.ours_content.iter().take(4) {
+                        lines.push(format!("  {}", line));
+                    }
+                    if hunk.ours_content.len() > 4 {
+                        lines.push("  ...".to_string());
+                    }
+                    lines.push("=======".to_string());
+                    for line in hunk.theirs_content.iter().take(4) {
+                        lines.push(format!("  {}", line));
+                    }
+                    if hunk.theirs_content.len() > 4 {
+                        lines.push("  ...".to_string());
+                    }
+                    lines.push(format!(">>>>>>> {}", hunk.theirs_branch));
+                    preview_count += 1;
                 }
             }
         }
@@ -647,6 +679,21 @@ impl RepoState {
             wt.staged_new, wt.staged_modified, wt.staged_deleted, wt.staged_renamed,
             wt.unstaged_modified, wt.unstaged_deleted, wt.untracked
         ));
+
+        if !wt.staged_files.is_empty() {
+            let file_list: Vec<String> = wt.staged_files.iter().take(15).map(|f| format!("\"{}\"", f)).collect();
+            lines.push(format!("STAGED_FILES: [{}]", file_list.join(", ")));
+        }
+
+        if !wt.unstaged_files.is_empty() {
+            let file_list: Vec<String> = wt.unstaged_files.iter().take(15).map(|f| format!("\"{}\"", f)).collect();
+            lines.push(format!("UNSTAGED_FILES: [{}]", file_list.join(", ")));
+        }
+
+        if !wt.untracked_files.is_empty() {
+            let file_list: Vec<String> = wt.untracked_files.iter().take(15).map(|f| format!("\"{}\"", f)).collect();
+            lines.push(format!("UNTRACKED_FILES: [{}]", file_list.join(", ")));
+        }
 
         if let Some(ref tracking) = self.tracking {
             lines.push(format!(
@@ -692,6 +739,19 @@ impl RepoState {
         if let Some(ref gm) = self.graph_metrics {
             if gm.has_wip_commits {
                 lines.push("GRAPH_SIGNAL: WIP/fixup commits detected in recent history".to_string());
+            }
+        }
+
+        // Append incoming commits from upstream or ongoing rebase/merge
+        if !self.incoming_commits.is_empty() {
+            lines.push("INCOMING_COMMITS:".to_string());
+            for c in self.incoming_commits.iter().take(5) {
+                let decorations = if c.decorations.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", c.decorations.join(", "))
+                };
+                lines.push(format!("  {} {}{}", c.sha_short, c.message_oneline, decorations));
             }
         }
 

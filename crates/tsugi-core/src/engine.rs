@@ -692,16 +692,7 @@ Done!"#;
             },
             ongoing_operation: None,
             conflicts: vec![],
-            working_tree: crate::types::WorkingTreeSummary {
-                staged_new: 0,
-                staged_modified: 0,
-                staged_deleted: 0,
-                staged_renamed: 0,
-                unstaged_modified: 0,
-                unstaged_deleted: 0,
-                untracked: 0,
-                ignored_but_tracked: 0,
-            },
+            working_tree: crate::types::WorkingTreeSummary::default(),
             recent_commits: vec![],
             recent_reflog: vec![],
             tracking: None,
@@ -715,6 +706,7 @@ Done!"#;
             large_files: vec![],
             installed_hooks: vec![],
             graph_metrics: None,
+            incoming_commits: vec![],
         };
 
         let plan = backend.generate_plan(&state, "test", &config).unwrap();

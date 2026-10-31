@@ -933,6 +933,7 @@ mod tests {
             large_files: Vec::new(),
             installed_hooks: Vec::new(),
             graph_metrics: None,
+            incoming_commits: Vec::new(),
         }
     }
 
